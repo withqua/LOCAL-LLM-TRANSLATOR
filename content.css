@@ -126,7 +126,11 @@
 .llt-translation.llt-block.llt-loading {
   display: flex !important;
   align-items: center !important;
-  gap: 0.5em !important;
+  justify-content: center !important;
+  width: fit-content !important;
+  min-width: 2.2em !important;
+  min-height: 2.2em !important;
+  padding: 0.4em !important;
 }
 
 .llt-spinner {
@@ -138,10 +142,6 @@
   border-radius: 50% !important;
   animation: llt-spin 0.8s linear infinite !important;
   flex: 0 0 auto !important;
-}
-
-.llt-loading-text {
-  white-space: nowrap !important;
 }
 
 @keyframes llt-spin {

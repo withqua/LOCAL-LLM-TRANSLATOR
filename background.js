@@ -1,7 +1,8 @@
 const DEFAULT_SETTINGS = {
   endpoint: "http://localhost:1234/v1/chat/completions",
   model: "local-model",
-  targetLanguage: "Korean",
+  sourceLanguage: "auto",
+  targetLanguage: "ko",
   requestDelayMs: 0,
   maxBatchChars: 5000,
   chunkSize: 24,
@@ -17,16 +18,17 @@ const DEFAULT_SETTINGS = {
   translationOffsetX: 0,
   translationOffsetY: 0,
   customPrompt:
-    "Translate webpage text into natural, easy-to-read {targetLanguage}. Use plain modern wording and natural sentence order instead of stiff word-for-word phrasing. Keep short titles concise and title-like; make snippets and paragraphs smooth, readable sentences. Preserve meaning, names, brands, numbers, URLs, technical terms, line breaks, and numeric link placeholders like [[LINK_0]]...[[/LINK_0]] exactly when they appear. Never invent or expose placeholder text. Return only a JSON array of translated strings in the same order."
+    "Translate webpage text into natural, easy-to-read {targetLanguage}. Use plain modern wording and natural sentence order instead of stiff word-for-word phrasing. Translate headings fully and faithfully; do not shorten, summarize, or abbreviate titles. Make snippets and paragraphs smooth, readable sentences. Preserve meaning, names, brands, product names, domain names, URLs, email addresses, technical terms, line breaks, and short literal tokens such as bit.ly, tinyurl, forum-help, and ChatGPT exactly when they appear. Keep every URL and domain unchanged. Never omit content. Return only a JSON array of translated strings in the same order."
 };
 
 const MAX_CACHE_ITEMS = 600;
 const LEGACY_CACHE_STORAGE_KEY = "translationCache";
-const LINK_MARKER_PATTERN = /\[\[\s*\/?\s*LINK_(?:\d+|N)\s*]]/gi;
-const LITERAL_LINK_MARKER_PATTERN = /\[\[\s*\/?\s*LINK_N\s*]]/gi;
+const LINK_MARKER_PATTERN = /\[\[\s*\/?\s*(?:LINK|TERM)_(?:\d+|N)\s*]]/gi;
+const LITERAL_LINK_MARKER_PATTERN = /\[\[\s*\/?\s*(?:LINK|TERM)_N\s*]]/gi;
 const LEGACY_DEFAULT_PROMPTS = [
-  "Translate the webpage text into {targetLanguage}. Keep the original meaning, names, numbers, technical terms, line breaks, and placeholders like [[LINK_0]]...[[/LINK_0]]. Return only a JSON array of translated strings in the same order.",
-  "Translate the webpage text into {targetLanguage}. Keep the original meaning, names, numbers, technical terms, line breaks, and link placeholders like [[LINK_0]]...[[/LINK_0]] exactly when they appear. Do not invent visible placeholder text. Return only a JSON array of translated strings in the same order."
+  "Translate the webpage text into {targetLanguage}. Keep the original meaning, names, numbers, technical terms, line breaks, URLs, domain names, email addresses, and literals such as bit.ly, tinyurl, forum-help, and ChatGPT unchanged. Return only a JSON array of translated strings in the same order.",
+  "Translate the webpage text into {targetLanguage}. Keep the original meaning, names, numbers, technical terms, line breaks, URLs, domain names, email addresses, and literals such as bit.ly, tinyurl, forum-help, and ChatGPT exactly when they appear. Return only a JSON array of translated strings in the same order.",
+  "Translate webpage text into natural, easy-to-read {targetLanguage}. Use plain modern wording and natural sentence order instead of stiff word-for-word phrasing. Keep short titles concise and title-like; make snippets and paragraphs smooth, readable sentences. Preserve meaning, names, brands, numbers, URLs, domain names, email addresses, technical terms, line breaks, and literals such as bit.ly, tinyurl, forum-help, and ChatGPT exactly when they appear. Return only a JSON array of translated strings in the same order."
 ];
 const translationCache = new Map();
 const activeTranslationControllers = new Map();
@@ -166,21 +168,16 @@ async function saveSettings(rawSettings, pageUrl) {
 
 function normalizeSettings(settings = {}) {
   const merged = { ...DEFAULT_SETTINGS, ...settings };
-  const requestDelayMs = Number(merged.requestDelayMs) === 120
-    ? DEFAULT_SETTINGS.requestDelayMs
-    : clampNumber(merged.requestDelayMs, DEFAULT_SETTINGS.requestDelayMs, 0, 5000);
-  const maxBatchChars = Number(merged.maxBatchChars) === 1800
-    ? DEFAULT_SETTINGS.maxBatchChars
-    : clampNumber(merged.maxBatchChars, DEFAULT_SETTINGS.maxBatchChars, 300, 12000);
-  const chunkSize = Number(merged.chunkSize) === 4 || Number(merged.chunkSize) === 12
-    ? DEFAULT_SETTINGS.chunkSize
-    : clampInteger(merged.chunkSize, DEFAULT_SETTINGS.chunkSize, 1, 24);
+  const requestDelayMs = clampNumber(merged.requestDelayMs, DEFAULT_SETTINGS.requestDelayMs, 0, 5000);
+  const maxBatchChars = clampNumber(merged.maxBatchChars, DEFAULT_SETTINGS.maxBatchChars, 300, 12000);
+  const chunkSize = clampInteger(merged.chunkSize, DEFAULT_SETTINGS.chunkSize, 1, 24);
 
   return {
     ...merged,
     endpoint: String(merged.endpoint || "").trim() || DEFAULT_SETTINGS.endpoint,
     model: String(merged.model || "").trim() || DEFAULT_SETTINGS.model,
-    targetLanguage: String(merged.targetLanguage || "").trim() || DEFAULT_SETTINGS.targetLanguage,
+    sourceLanguage: normalizeChoice(String(merged.sourceLanguage || "").trim(), ["auto", "en", "ko", "ja", "zh", "es"], DEFAULT_SETTINGS.sourceLanguage),
+    targetLanguage: normalizeChoice(String(merged.targetLanguage || "").trim(), ["en", "ko", "ja", "zh", "es"], DEFAULT_SETTINGS.targetLanguage),
     requestDelayMs,
     maxBatchChars,
     chunkSize,
@@ -392,6 +389,8 @@ async function translateTexts(texts, options = {}) {
     throwIfAborted(settings.signal);
 
     await retryBadTranslations(batch, translated, settings);
+    await retryMissingTranslations(batch, translated, settings);
+    await retrySuspiciousTranslations(batch, translated, settings);
 
     batch.forEach((item, batchIndex) => {
       const value = normalizeModelTranslation(translated[batchIndex] || "");
@@ -465,19 +464,27 @@ async function requestLmStudio(texts, settings) {
 }
 
 function buildPrompt(settings) {
+  const targetLabel = getLanguageLabel(settings.targetLanguage);
+  const sourceInstruction = settings.sourceLanguage === "auto"
+    ? "The source language may vary by text item."
+    : `The preferred source language is ${getLanguageLabel(settings.sourceLanguage)}.`;
+
   if (settings.simpleRetry) {
-    return `Translate to ${settings.targetLanguage}. Preserve numeric link markers such as [[LINK_0]] and [[/LINK_0]] exactly when present. Return only a JSON array.`;
+    return `Translate to ${targetLabel}. ${sourceInstruction} Preserve URLs, domain names, email addresses, and literals such as bit.ly, tinyurl, forum-help, and ChatGPT exactly when present. Return only a JSON array.`;
   }
 
   const prompt = settings.customPrompt || DEFAULT_SETTINGS.customPrompt;
-  return prompt.replaceAll("{targetLanguage}", settings.targetLanguage);
+  return prompt
+    .replaceAll("{targetLanguage}", targetLabel)
+    .replaceAll("{sourceLanguage}", settings.sourceLanguage === "auto" ? "Auto-detect" : getLanguageLabel(settings.sourceLanguage));
 }
 
 function buildUserPayload(texts, settings) {
+  const targetLabel = getLanguageLabel(settings.targetLanguage);
   return {
     instruction: settings.simpleRetry
-      ? `Translate to ${settings.targetLanguage}. Preserve numeric link markers. No mojibake. JSON array only.`
-      : "Translate each item using the system rules. Preserve numeric link markers. JSON array only, same order.",
+      ? `Translate to ${targetLabel}. Preserve URLs, domain names, email addresses, and literals such as bit.ly, tinyurl, forum-help, and ChatGPT exactly. No mojibake. JSON array only.`
+      : `Translate each item to ${targetLabel}. Preserve URLs, domain names, email addresses, and literals such as bit.ly, tinyurl, forum-help, and ChatGPT exactly. JSON array only, same order.`,
     texts
   };
 }
@@ -493,14 +500,131 @@ async function retryBadTranslations(batch, translated, settings) {
     throwIfAborted(settings.signal);
     const retried = await requestLmStudio([source], { ...settings, simpleRetry: true, maxBatchChars: source.length });
     const retryValue = retried[0] || "";
-    if (!isLikelyBadKoreanTranslation(source, retryValue)) {
+    if (!isLikelyBadKoreanTranslation(source, retryValue) && !hasBrokenAnyMarkers(source, retryValue)) {
       translated[index] = retryValue;
     }
   }
 }
 
+async function retryMissingTranslations(batch, translated, settings) {
+  for (let index = 0; index < batch.length; index += 1) {
+    const source = batch[index].text;
+    const value = translated[index] || "";
+    if (!shouldRetryMissingTranslation(source, value, settings)) continue;
+
+    throwIfAborted(settings.signal);
+    const retried = await requestLmStudio([source], { ...settings, simpleRetry: true, maxBatchChars: source.length });
+    const retryValue = retried[0] || "";
+    if (normalizeModelTranslation(retryValue) && !shouldRetryMissingTranslation(source, retryValue, settings)) {
+      translated[index] = retryValue;
+    }
+  }
+}
+
+async function retrySuspiciousTranslations(batch, translated, settings) {
+  for (let index = 0; index < batch.length; index += 1) {
+    const source = batch[index].text;
+    const value = translated[index] || "";
+    if (!shouldRetrySuspiciousTranslation(source, value, settings)) continue;
+
+    throwIfAborted(settings.signal);
+    const retried = await requestLmStudio([source], { ...settings, simpleRetry: true, maxBatchChars: source.length });
+    const retryValue = retried[0] || "";
+    if (normalizeModelTranslation(retryValue) && !shouldRetrySuspiciousTranslation(source, retryValue, settings)) {
+      translated[index] = retryValue;
+    }
+  }
+}
+
+function shouldRetryMissingTranslation(source, translated, settings) {
+  const normalizedSource = normalizeText(stripLinkMarkers(source));
+  const normalizedTranslated = normalizeText(stripLinkMarkers(translated));
+  if (!normalizedSource) return false;
+
+  if (!normalizedTranslated) {
+    return normalizedSource.length >= 3;
+  }
+
+  if (hasBrokenAnyMarkers(source, translated)) {
+    return true;
+  }
+
+  if (isMissingProtectedLiterals(normalizedSource, normalizedTranslated)) {
+    return true;
+  }
+
+  const target = String(settings.targetLanguage || "").trim().toLowerCase();
+  const sourceLooksLikeTarget = detectSimpleLanguage(normalizedSource) === target;
+  if (sourceLooksLikeTarget) return false;
+
+  return normalizedTranslated === normalizedSource;
+}
+
+function shouldRetrySuspiciousTranslation(source, translated, settings) {
+  const normalizedSource = normalizeText(stripLinkMarkers(source));
+  const normalizedTranslated = normalizeText(stripLinkMarkers(translated));
+  if (!normalizedSource || !normalizedTranslated) return false;
+
+  if (normalizedTranslated === "[object Object]") return true;
+
+  const sourceWords = normalizedSource.split(/\s+/).filter(Boolean).length;
+  const isShortHeadingLikeSource =
+    normalizedSource.length <= 80 &&
+    sourceWords <= 8 &&
+    !/[.!?。！？]\s*$/.test(normalizedSource);
+
+  if (!isShortHeadingLikeSource) return false;
+
+  if (normalizedTranslated.includes("\n")) return true;
+  if (normalizedTranslated.length >= Math.max(90, normalizedSource.length * 3)) return true;
+
+  return false;
+}
+
+function hasBrokenAnyMarkers(source, translated) {
+  return hasBrokenMarkersByType(source, translated, "LINK")
+    || hasBrokenMarkersByType(source, translated, "TERM");
+}
+
+function hasBrokenMarkersByType(source, translated, type) {
+  const sourceMarkers = collectMarkerIds(source, type);
+  if (!sourceMarkers.length) return false;
+
+  const translatedMarkers = collectMarkerIds(translated, type);
+  if (translatedMarkers.length !== sourceMarkers.length) return true;
+
+  for (const marker of sourceMarkers) {
+    if (!translatedMarkers.includes(marker)) return true;
+  }
+
+  return false;
+}
+
+function collectMarkerIds(text, type) {
+  const ids = [];
+  const pattern = new RegExp(`(?:\\[\\[|\\[)\\s*${type}_(\\d+)\\s*(?:]]|])`, "gi");
+  let match;
+  while ((match = pattern.exec(String(text || ""))) !== null) {
+    ids.push(match[1]);
+  }
+  return ids;
+}
+
+function isMissingProtectedLiterals(source, translated) {
+  const literals = extractProtectedLiterals(source);
+  if (!literals.length) return false;
+
+  const translatedLower = String(translated || "").toLowerCase();
+  return literals.some((literal) => !translatedLower.includes(literal.toLowerCase()));
+}
+
+function extractProtectedLiterals(text) {
+  const matches = String(text || "").match(/\b(?:(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?:\/[^\s)\]]*)?|tinyurl|forum-help|chatgpt|bitly)\b/gi) || [];
+  return Array.from(new Set(matches.filter(Boolean)));
+}
+
 function shouldValidateKorean(settings) {
-  return /^(ko|kor|korean|한국어|한글)$/i.test(String(settings.targetLanguage || "").trim());
+  return String(settings.targetLanguage || "").trim() === "ko";
 }
 
 function isLikelyBadKoreanTranslation(source, translated) {
@@ -525,6 +649,24 @@ function countMatches(text, pattern) {
   return (String(text || "").match(pattern) || []).length;
 }
 
+function detectSimpleLanguage(text) {
+  const normalized = normalizeText(text);
+  if (!normalized) return "";
+
+  if (/[가-힣]/.test(normalized)) return "ko";
+  if (/[\u3040-\u30ff]/.test(normalized)) return "ja";
+  if (/[\u4e00-\u9fff]/.test(normalized)) return "zh";
+
+  const lower = normalized.toLowerCase();
+  const spanishHints = countMatches(lower, /\b(el|la|los|las|de|del|para|como|que|por|una|un|y|en)\b/g)
+    + countMatches(lower, /[áéíóúñ¿¡]/g);
+  const englishHints = countMatches(lower, /\b(the|and|with|that|this|from|you|your|for|page|guide|memory|forum)\b/g);
+
+  if (spanishHints >= englishHints + 2) return "es";
+  if (englishHints > 0) return "en";
+  return "";
+}
+
 function parseTranslationArray(content, expectedLength) {
   const trimmed = content.trim().replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
   let parsed;
@@ -545,7 +687,7 @@ function parseTranslationArray(content, expectedLength) {
     throw new Error("Local model response is not an array.");
   }
 
-  return Array.from({ length: expectedLength }, (_, index) => String(parsed[index] || ""));
+  return Array.from({ length: expectedLength }, (_, index) => coerceTranslationValue(parsed[index]));
 }
 
 function buildBatches(items, maxChars) {
@@ -577,7 +719,24 @@ function normalizeText(text) {
 
 function cacheKey(text, settings) {
   const promptKey = normalizeText(settings.customPrompt || DEFAULT_SETTINGS.customPrompt);
-  return `${settings.model}::${settings.targetLanguage}::${promptKey}::${text}`;
+  return `${settings.model}::${settings.sourceLanguage}::${settings.targetLanguage}::${promptKey}::${text}`;
+}
+
+function getLanguageLabel(code) {
+  switch (String(code || "").trim()) {
+    case "en":
+      return "English";
+    case "ko":
+      return "Korean";
+    case "ja":
+      return "Japanese";
+    case "zh":
+      return "Chinese";
+    case "es":
+      return "Spanish";
+    default:
+      return "Auto-detect";
+  }
 }
 
 function rememberTranslation(key, value) {
@@ -603,9 +762,35 @@ async function clearTranslationCache() {
 
 function normalizeModelTranslation(text) {
   return String(text || "")
+    .replace(/\[\s*(LINK|TERM)_(\d+)\s*]]/gi, (_, type, index) => `[[${type.toUpperCase()}_${index}]]`)
+    .replace(/\[\s*\/\s*(LINK|TERM)_(\d+)\s*]]/gi, (_, type, index) => `[[/${type.toUpperCase()}_${index}]]`)
+    .replace(/\[\[\s*(LINK|TERM)_(\d+)\s*]/gi, (_, type, index) => `[[${type.toUpperCase()}_${index}]]`)
+    .replace(/\[\[\s*\/\s*(LINK|TERM)_(\d+)\s*]/gi, (_, type, index) => `[[/${type.toUpperCase()}_${index}]]`)
     .replace(/\[\[\s*LINK_(\d+)\s*]]/gi, (_, index) => `[[LINK_${index}]]`)
     .replace(/\[\[\s*\/\s*LINK_(\d+)\s*]]/gi, (_, index) => `[[/LINK_${index}]]`)
+    .replace(/\[\[\s*TERM_(\d+)\s*]]/gi, (_, index) => `[[TERM_${index}]]`)
+    .replace(/\[\[\s*\/\s*TERM_(\d+)\s*]]/gi, (_, index) => `[[/TERM_${index}]]`)
     .replace(LITERAL_LINK_MARKER_PATTERN, "");
+}
+
+function coerceTranslationValue(value) {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  if (typeof value === "object") {
+    const candidates = [
+      value.translation,
+      value.translated,
+      value.text,
+      value.content,
+      value.output
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate.trim()) {
+        return candidate;
+      }
+    }
+  }
+  return String(value || "");
 }
 
 function getSenderRequestKey(sender, scope = "page") {

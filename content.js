@@ -6,14 +6,32 @@ const STATE = {
   lastUrl: location.href,
   routeTimer: null,
   autoTranslateObserver: null,
+  liveTranslateTimer: null,
   selectionRequestId: 0,
   translationRunId: 0,
   nextTranslationId: 1
 };
 
-const LINK_PAIR_PATTERN = /\[\[\s*LINK_(\d+)\s*]]([\s\S]*?)\[\[\s*\/\s*LINK_\1\s*]]/gi;
-const LINK_MARKER_PATTERN = /\[\[\s*\/?\s*LINK_(?:\d+|N)\s*]]/gi;
+const TERM_PAIR_PATTERN = /\[\[\s*TERM_(\d+)\s*]]([\s\S]*?)\[\[\s*\/\s*TERM_\1\s*]]/gi;
+const TERM_MARKER_PATTERN = /\[\[\s*\/?\s*TERM_(?:\d+|N)\s*]]/gi;
+const PROTECTED_TERM_PATTERN = /\b(?:(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?:\/[^\s)\]]*)?|tinyurl|forum-help|chatgpt|bitly)\b/gi;
 const GOOGLE_TITLE_SELECTOR = "h3,.LC20lb,[role='heading']";
+const BLOCK_ELEMENT_SELECTOR = [
+  "p",
+  "li",
+  "blockquote",
+  "figcaption",
+  "dt",
+  "dd",
+  "td",
+  "th",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6"
+].join(",");
 const TRANSLATION_WIDTHS = new Set(["content", "full"]);
 const TRANSLATION_DENSITIES = new Set(["comfortable", "compact"]);
 const TITLE_PLACEMENTS = new Set(["auto", "beside", "below"]);
@@ -21,61 +39,20 @@ const extensionApi = globalThis.browser || globalThis.chrome;
 const USES_PROMISE_API = typeof globalThis.browser !== "undefined";
 
 const TEXT_SELECTOR = [
-  "article p",
-  "main p",
-  "section p",
-  "article div",
-  "main div",
-  "section div",
-  ".body-page p",
-  ".body-page li",
-  ".body-page div",
-  ".contents p",
-  ".contents li",
-  ".contents div",
-  ".static-page p",
-  ".static-page li",
-  ".static-page div",
   "p",
-  "article a[href]",
-  "main a[href]",
-  "section a[href]",
-  "header a[href]",
-  "nav a[href]",
-  "[role='navigation'] a[href]",
-  ".d-header a[href]",
-  "header button",
-  "nav button",
-  "[role='navigation'] button",
-  ".d-header button",
-  ".navigation-container button",
-  ".category-breadcrumb button",
-  ".nav-pills button",
-  "a.title",
-  "a.raw-topic-link",
-  "a[href].topic-title",
-  ".LC20lb",
-  "a[href] .LC20lb",
-  "shreddit-title",
-  "[slot='title']",
-  "[data-testid='post-title']",
-  "[data-testid*='title']",
-  "[data-testid*='description']",
-  ".VwiC3b",
-  ".IsZvec",
-  ".MUxGbd",
-  "[data-sncf]",
-  ".topic-title",
-  ".fancy-title",
-  ".link-top-line a",
   "li",
   "blockquote",
+  "figcaption",
+  "dt",
+  "dd",
+  "td",
+  "th",
   "h1",
   "h2",
   "h3",
   "h4",
-  "td",
-  "th"
+  "h5",
+  "h6"
 ].join(",");
 
 const SKIP_SELECTOR = [
@@ -127,6 +104,7 @@ async function init() {
   const settings = await sendRuntimeMessage({ type: "GET_SETTINGS" });
   if (!settings) return;
   STATE.settings = settings;
+  syncExistingTranslationState();
 
   if (settings.autoTranslate) {
     scheduleAutoTranslate();
@@ -134,6 +112,7 @@ async function init() {
 
   installRouteChangeWatcher();
   installAutoTranslateMutationWatcher();
+  exposeDebugApi();
 }
 
 function installRuntimeMessageListener() {
@@ -153,7 +132,19 @@ function installRuntimeMessageListener() {
 
     if (message?.type === "SET_SETTINGS") {
       const wasAutoTranslateEnabled = Boolean(STATE.settings?.autoTranslate);
+      const previousTargetLanguage = getTargetLanguageCode();
       STATE.settings = { ...STATE.settings, ...(message.settings || {}) };
+      const nextTargetLanguage = getTargetLanguageCode();
+      if (
+        hasExistingTranslations() &&
+        previousTargetLanguage &&
+        nextTargetLanguage &&
+        previousTargetLanguage !== nextTargetLanguage
+      ) {
+        clearTranslations();
+        STATE.translated = false;
+      }
+      syncExistingTranslationState();
       applySettingsToExistingTranslations();
       if (!STATE.settings.autoTranslate) {
         clearTimeout(STATE.routeTimer);
@@ -172,62 +163,235 @@ function installRuntimeMessageListener() {
 
 async function togglePageTranslation() {
   if (STATE.translating) return;
+  syncExistingTranslationState();
   if (STATE.translated) {
     restorePage();
     return;
   }
 
+  await translatePageBlocks({ incremental: false });
+}
+
+async function translatePageBlocks({ incremental = false } = {}) {
+  if (STATE.translating) return;
+
   const runId = ++STATE.translationRunId;
   const startUrl = location.href;
   STATE.translating = true;
-  showPageStatus("페이지 번역 중...");
+  showPageStatus(incremental ? "새 콘텐츠 번역 중..." : "페이지 번역 중...");
   let activeChunk = [];
   let shouldAutoHideStatus = true;
   const keepAlivePort = openTranslationPort();
 
   try {
-    const blocks = collectTranslatableBlocks();
-    if (!blocks.length) {
-      showPageStatus("번역할 텍스트를 찾지 못했습니다.");
+    let initialBlocks = collectTranslatableBlocks();
+    if (!initialBlocks.length) {
+      if (!incremental) {
+        showPageStatus("번역할 텍스트를 찾지 못했습니다.");
+      }
       return;
     }
 
     let completedCount = 0;
-    const totalCount = getBlocksElementCount(blocks);
-    for (const chunk of chunkBlocks(blocks, getChunkSize(), getMaxBatchChars())) {
-      activeChunk = chunk;
-      if (isStaleTranslationRun(runId, startUrl)) return;
+    let estimatedTotal = getBlocksElementCount(initialBlocks);
+    const maxPasses = 4;
 
-      chunk.forEach((item) => {
-        item.elements.forEach((element) => insertLoadingTranslation(element));
-      });
+    for (let pass = 0; pass < maxPasses; pass += 1) {
+      if (pass === 0) {
+        const topPriorityElements = collectTopPriorityElements();
+        estimatedTotal = Math.max(estimatedTotal, completedCount + topPriorityElements.length);
 
-      const texts = chunk.map((item) => item.text);
-      const response = await sendRuntimeMessage({
-        type: "TRANSLATE_TEXTS",
-        scope: "page",
-        texts
-      }, getMessageTimeoutMs());
+        for (const element of topPriorityElements) {
+          if (isStaleTranslationRun(runId, startUrl)) return;
+          const text = buildTranslationInput(element).text;
+          if (!text) continue;
 
-      if (isStaleTranslationRun(runId, startUrl)) return;
+          insertLoadingTranslation(element);
+          activeChunk = [{ elements: [element], text }];
 
-      if (!response?.ok) {
-        throw new Error(response?.error || "번역 실패.");
+          const response = await sendRuntimeMessage({
+            type: "TRANSLATE_TEXTS",
+            scope: "page",
+            texts: [text]
+          }, getMessageTimeoutMs());
+
+          if (isStaleTranslationRun(runId, startUrl)) return;
+          if (!response?.ok) {
+            throw new Error(response?.error || "번역 실패.");
+          }
+
+          finishBilingualTranslation(element, response.translations?.[0] || "");
+          completedCount += 1;
+          showPageStatus(`${incremental ? "새 콘텐츠 번역 중..." : "페이지 번역 중..."} ${completedCount}/${estimatedTotal}`);
+          activeChunk = [];
+        }
       }
 
-      response.translations.forEach((translation, index) => {
-        chunk[index].elements.forEach((element) => {
-          finishBilingualTranslation(element, translation);
-        });
-      });
+      const passBlocks = pass === 0 ? initialBlocks : collectTranslatableBlocks();
+      const criticalElements = collectCriticalRemainingElements();
+      const fallbackBlocks = collectFallbackBlocks();
+      const remainingElements = collectRemainingFallbackElements();
+      const rescueElements = collectLastResortElements();
+      const hasWork =
+        passBlocks.length ||
+        criticalElements.length ||
+        fallbackBlocks.length ||
+        remainingElements.length ||
+        rescueElements.length;
 
-      completedCount += getBlocksElementCount(chunk);
-      showPageStatus(`페이지 번역 중... ${completedCount}/${totalCount}`);
-      activeChunk = [];
+      if (!hasWork) break;
+
+      estimatedTotal = Math.max(
+        estimatedTotal,
+        completedCount +
+          getBlocksElementCount(passBlocks) +
+          criticalElements.length +
+          getBlocksElementCount(fallbackBlocks) +
+          remainingElements.length +
+          rescueElements.length
+      );
+
+      for (const chunk of chunkBlocks(passBlocks, getChunkSize(), getMaxBatchChars())) {
+        activeChunk = chunk;
+        if (isStaleTranslationRun(runId, startUrl)) return;
+
+        chunk.forEach((item) => {
+          item.elements.forEach((element) => insertLoadingTranslation(element));
+        });
+
+        const texts = chunk.map((item) => item.text);
+        const response = await sendRuntimeMessage({
+          type: "TRANSLATE_TEXTS",
+          scope: "page",
+          texts
+        }, getMessageTimeoutMs());
+
+        if (isStaleTranslationRun(runId, startUrl)) return;
+
+        if (!response?.ok) {
+          throw new Error(response?.error || "번역 실패.");
+        }
+
+        response.translations.forEach((translation, index) => {
+          chunk[index].elements.forEach((element) => {
+            finishBilingualTranslation(element, translation);
+          });
+        });
+
+        completedCount += getBlocksElementCount(chunk);
+        showPageStatus(`${incremental ? "새 콘텐츠 번역 중..." : "페이지 번역 중..."} ${completedCount}/${estimatedTotal}`);
+        activeChunk = [];
+      }
+
+      for (const element of criticalElements) {
+        if (isStaleTranslationRun(runId, startUrl)) return;
+        const text = buildTranslationInput(element).text;
+        if (!text) continue;
+
+        insertLoadingTranslation(element);
+        activeChunk = [{ elements: [element], text }];
+
+        const response = await sendRuntimeMessage({
+          type: "TRANSLATE_TEXTS",
+          scope: "page",
+          texts: [text]
+        }, getMessageTimeoutMs());
+
+        if (isStaleTranslationRun(runId, startUrl)) return;
+        if (!response?.ok) {
+          throw new Error(response?.error || "번역 실패.");
+        }
+
+        finishBilingualTranslation(element, response.translations?.[0] || "");
+        completedCount += 1;
+        showPageStatus(`${incremental ? "새 콘텐츠 번역 중..." : "페이지 번역 중..."} ${completedCount}/${estimatedTotal}`);
+        activeChunk = [];
+      }
+
+      for (const chunk of chunkBlocks(fallbackBlocks, Math.max(4, Math.floor(getChunkSize() / 2)), getMaxBatchChars())) {
+        activeChunk = chunk;
+        if (isStaleTranslationRun(runId, startUrl)) return;
+
+        chunk.forEach((item) => {
+          item.elements.forEach((element) => insertLoadingTranslation(element));
+        });
+
+        const texts = chunk.map((item) => item.text);
+        const response = await sendRuntimeMessage({
+          type: "TRANSLATE_TEXTS",
+          scope: "page",
+          texts
+        }, getMessageTimeoutMs());
+
+        if (isStaleTranslationRun(runId, startUrl)) return;
+
+        if (!response?.ok) {
+          throw new Error(response?.error || "번역 실패.");
+        }
+
+        response.translations.forEach((translation, index) => {
+          chunk[index].elements.forEach((element) => {
+            finishBilingualTranslation(element, translation);
+          });
+        });
+
+        completedCount += getBlocksElementCount(chunk);
+        showPageStatus(`${incremental ? "새 콘텐츠 번역 중..." : "페이지 번역 중..."} ${completedCount}/${estimatedTotal}`);
+        activeChunk = [];
+      }
+
+      for (const element of remainingElements) {
+        if (isStaleTranslationRun(runId, startUrl)) return;
+        insertLoadingTranslation(element);
+        activeChunk = [{ elements: [element], text: buildTranslationInput(element).text }];
+
+        const response = await sendRuntimeMessage({
+          type: "TRANSLATE_TEXTS",
+          scope: "page",
+          texts: [activeChunk[0].text]
+        }, getMessageTimeoutMs());
+
+        if (isStaleTranslationRun(runId, startUrl)) return;
+        if (!response?.ok) {
+          throw new Error(response?.error || "번역 실패.");
+        }
+
+        finishBilingualTranslation(element, response.translations?.[0] || "");
+        completedCount += 1;
+        showPageStatus(`${incremental ? "새 콘텐츠 번역 중..." : "페이지 번역 중..."} ${completedCount}/${estimatedTotal}`);
+        activeChunk = [];
+      }
+
+      for (const element of rescueElements) {
+        if (isStaleTranslationRun(runId, startUrl)) return;
+        const text = buildTranslationInput(element).text;
+        if (!text) continue;
+
+        insertLoadingTranslation(element);
+        activeChunk = [{ elements: [element], text }];
+
+        const response = await sendRuntimeMessage({
+          type: "TRANSLATE_TEXTS",
+          scope: "page",
+          texts: [text]
+        }, getMessageTimeoutMs());
+
+        if (isStaleTranslationRun(runId, startUrl)) return;
+        if (!response?.ok) {
+          throw new Error(response?.error || "번역 실패.");
+        }
+
+        finishBilingualTranslation(element, response.translations?.[0] || "");
+        completedCount += 1;
+        showPageStatus(`${incremental ? "새 콘텐츠 번역 중..." : "페이지 번역 중..."} ${completedCount}/${estimatedTotal}`);
+        activeChunk = [];
+      }
+
+      await delay(120);
     }
 
     STATE.translated = true;
-    showPageStatus("번역 완료.");
+    showPageStatus(incremental ? "새 콘텐츠 번역 완료." : "번역 완료.");
   } catch (error) {
     if (isStaleTranslationRun(runId, startUrl)) return;
     cancelActivePageTranslation();
@@ -241,22 +405,32 @@ async function togglePageTranslation() {
     closeTranslationPort(keepAlivePort);
     if (!isStaleTranslationRun(runId, startUrl)) {
       STATE.translating = false;
-      if (shouldAutoHideStatus) {
+      if (shouldAutoHideStatus && (!incremental || activeChunk.length === 0)) {
         setTimeout(removePageStatus, 1600);
       }
     }
   }
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function collectTranslatableBlocks() {
-  const elements = Array.from(document.querySelectorAll(TEXT_SELECTOR));
+  const elements = [
+    ...collectNavigationLabelElements(),
+    ...collectPriorityTextElements(),
+    ...collectRootScopedTextElements()
+  ];
   const blocksByText = new Map();
   const blocks = [];
+  const seenElements = new Set();
   const maxBlocks = getMaxBlocks();
   const maxBlockChars = getMaxBlockChars();
   let elementCount = 0;
 
   for (const element of elements) {
+    if (seenElements.has(element)) continue;
     if (!isGoodCandidate(element)) continue;
 
     const text = buildTranslationInput(element).text;
@@ -274,11 +448,256 @@ function collectTranslatableBlocks() {
       blocks.push(block);
     }
 
+    seenElements.add(element);
     elementCount += 1;
     if (elementCount >= maxBlocks) break;
   }
 
   return blocks;
+}
+
+function collectRootScopedTextElements() {
+  const roots = getContentRoots();
+  const elements = [];
+  const seen = new Set();
+
+  for (const root of roots) {
+    if (!(root instanceof HTMLElement)) continue;
+    for (const element of root.querySelectorAll(TEXT_SELECTOR)) {
+      if (!(element instanceof HTMLElement)) continue;
+      if (seen.has(element)) continue;
+      seen.add(element);
+      elements.push(element);
+    }
+  }
+
+  return elements;
+}
+
+function collectPriorityTextElements() {
+  const roots = getContentRoots();
+  const elements = [];
+  const seen = new Set();
+  const selector = "h1,h2,h3,h4,h5,h6,p,li,blockquote,figcaption,dt,dd,td,th";
+
+  for (const root of roots) {
+    if (!(root instanceof HTMLElement)) continue;
+    for (const element of root.querySelectorAll(selector)) {
+      if (!(element instanceof HTMLElement)) continue;
+      if (seen.has(element)) continue;
+      seen.add(element);
+      elements.push(element);
+    }
+  }
+
+  return elements;
+}
+
+function collectNavigationLabelElements() {
+  const elements = [];
+  const seen = new Set();
+  const selector = [
+    "header a[href]",
+    "header button",
+    "nav a[href]",
+    "nav button",
+    "[role='navigation'] a[href]",
+    "[role='navigation'] button",
+    ".d-header a[href]",
+    ".d-header button",
+    ".nav-pills a[href]",
+    ".nav-pills button",
+    ".navigation-container a[href]",
+    ".navigation-container button"
+  ].join(",");
+
+  for (const root of getNavigationRoots()) {
+    if (!(root instanceof HTMLElement)) continue;
+    for (const element of root.querySelectorAll(selector)) {
+      if (!(element instanceof HTMLElement)) continue;
+      if (seen.has(element)) continue;
+      seen.add(element);
+      elements.push(element);
+    }
+  }
+
+  return elements;
+}
+
+function collectTopPriorityElements() {
+  const roots = getContentRoots();
+  const results = [];
+  const seen = new Set();
+  const selector = "h1,h2,h3,h4,p,li,blockquote";
+
+  for (const root of roots) {
+    if (!(root instanceof HTMLElement)) continue;
+    for (const element of root.querySelectorAll(selector)) {
+      if (!(element instanceof HTMLElement)) continue;
+      if (seen.has(element)) continue;
+      seen.add(element);
+      if (!isGoodFallbackCandidate(element)) continue;
+      results.push(element);
+      if (results.length >= 12) {
+        return results;
+      }
+    }
+  }
+
+  return results;
+}
+
+function collectFallbackBlocks() {
+  const roots = getContentRoots();
+  const fallbackElements = [];
+  const seen = new Set();
+
+  for (const root of roots) {
+    if (!(root instanceof HTMLElement)) continue;
+    const candidates = root.querySelectorAll("h1,h2,h3,h4,p,li,blockquote");
+    for (const element of candidates) {
+      if (!(element instanceof HTMLElement)) continue;
+      if (seen.has(element)) continue;
+      seen.add(element);
+      if (hasLiveTranslationState(element)) continue;
+      if (findTranslationElement(element)) continue;
+      if (!isGoodFallbackCandidate(element)) continue;
+      fallbackElements.push(element);
+    }
+  }
+
+  const blocksByText = new Map();
+  const blocks = [];
+  for (const element of fallbackElements) {
+    const text = buildTranslationInput(element).text;
+    if (!text) continue;
+    const existing = blocksByText.get(text);
+    if (existing) {
+      existing.elements.push(element);
+    } else {
+      const block = { elements: [element], text };
+      blocksByText.set(text, block);
+      blocks.push(block);
+    }
+  }
+
+  return blocks;
+}
+
+function collectCriticalRemainingElements() {
+  const roots = getContentRoots();
+  const results = [];
+  const seen = new Set();
+  const selector = "h1,h2,h3,h4,p,li,blockquote";
+
+  for (const root of roots) {
+    if (!(root instanceof HTMLElement)) continue;
+    for (const element of root.querySelectorAll(selector)) {
+      if (!(element instanceof HTMLElement)) continue;
+      if (seen.has(element)) continue;
+      seen.add(element);
+      if (hasLiveTranslationState(element)) continue;
+      if (findTranslationElement(element)) continue;
+      if (!isActuallyVisible(element)) continue;
+      if (isRedundantInlineCandidate(element)) continue;
+      if (shouldSkipTargetLanguageText(getCandidateText(element))) continue;
+
+      const text = buildTranslationInput(element).text;
+      if (!text || text.length > getMaxBlockChars()) continue;
+      if (/^[\d\s.,:;!?()[\]{}'"`~@#$%^&*+=|\\/<>-]+$/.test(text)) continue;
+
+      results.push(element);
+      if (results.length >= 12) {
+        return results;
+      }
+    }
+  }
+
+  return results;
+}
+
+function collectRemainingFallbackElements() {
+  const roots = getContentRoots();
+  const results = [];
+  const seen = new Set();
+
+  for (const root of roots) {
+    if (!(root instanceof HTMLElement)) continue;
+    const candidates = root.querySelectorAll("h1,h2,h3,h4,p,li,blockquote");
+    for (const element of candidates) {
+      if (!(element instanceof HTMLElement)) continue;
+      if (seen.has(element)) continue;
+      seen.add(element);
+      if (hasLiveTranslationState(element)) continue;
+      if (findTranslationElement(element)) continue;
+      if (!isGoodFallbackCandidate(element)) continue;
+      results.push(element);
+    }
+  }
+
+  return results.slice(0, 40);
+}
+
+function collectLastResortElements() {
+  const roots = getContentRoots();
+  const results = [];
+  const seen = new Set();
+
+  for (const root of roots) {
+    if (!(root instanceof HTMLElement)) continue;
+    const candidates = root.querySelectorAll("h1,h2,h3,h4,h5,h6,p,li,blockquote");
+    for (const element of candidates) {
+      if (!(element instanceof HTMLElement)) continue;
+      if (seen.has(element)) continue;
+      seen.add(element);
+      if (hasLiveTranslationState(element)) continue;
+      if (findTranslationElement(element)) continue;
+      if (element.closest("header, nav, [role='navigation'], .d-header, .navigation-container, .nav-pills, .category-breadcrumb")) {
+        continue;
+      }
+      if (!isActuallyVisible(element)) continue;
+
+      const text = buildTranslationInput(element).text;
+      if (!text) continue;
+      if (text.length > getMaxBlockChars()) continue;
+      if (shouldSkipTargetLanguageText(text)) continue;
+      if (/^[\d\s.,:;!?()[\]{}'"`~@#$%^&*+=|\\/<>-]+$/.test(text)) continue;
+
+      results.push(element);
+      if (results.length >= 20) {
+        return results;
+      }
+    }
+  }
+
+  return results;
+}
+
+function getContentRoots() {
+  const prioritizedSelectorGroups = [
+    "[itemprop='mainContentOfPage'], .cooked",
+    "article, main",
+    ".body-page, .static-page",
+    ".contents"
+  ];
+
+  for (const selector of prioritizedSelectorGroups) {
+    const roots = Array.from(document.querySelectorAll(selector))
+      .filter((element) => element instanceof HTMLElement);
+    if (roots.length) {
+      return roots;
+    }
+  }
+
+  return [document.body].filter(Boolean);
+}
+
+function getNavigationRoots() {
+  const roots = Array.from(document.querySelectorAll(
+    "header, nav, [role='navigation'], .d-header, .navigation-container, .nav-pills"
+  )).filter((element) => element instanceof HTMLElement);
+
+  return roots.length ? roots : [document.body].filter(Boolean);
 }
 
 function getBlocksElementCount(blocks) {
@@ -288,20 +707,110 @@ function getBlocksElementCount(blocks) {
 function isGoodCandidate(element) {
   if (!(element instanceof HTMLElement)) return false;
   if (element.closest(SKIP_SELECTOR)) return false;
-  if (element.dataset.lltTranslated === "1") return false;
+  if (hasLiveTranslationState(element)) return false;
+  if (
+    element.closest("header, nav, [role='navigation'], .d-header, .navigation-container, .nav-pills, .category-breadcrumb") &&
+    !isNavigationLikeElement(element)
+  ) {
+    return false;
+  }
   if (isGoogleTitleOuterLink(element)) return false;
+  if (isRedundantInlineCandidate(element)) return false;
   if (isContainerWithOwnReadableChildren(element)) return false;
   if (isCompactLabelContainerWithChild(element)) return false;
+  if (!isActuallyVisible(element)) return false;
 
-  const text = extractElementText(element);
+  const text = getCandidateText(element);
+  if (shouldSkipLanguageLabel(text, element)) return false;
   if (text.length < 8 && !shouldUseCompactLabelTranslation(element)) return false;
   if (/^[\d\s.,:;!?()[\]{}'"`~@#$%^&*+=|\\/<>-]+$/.test(text)) return false;
+  if (shouldSkipTargetLanguageText(text)) return false;
 
   const rect = element.getBoundingClientRect();
   if (rect.width < 20 || rect.height < 8) return false;
   if (isNarrowLongLabel(element, text, rect)) return false;
 
   return true;
+}
+
+function isGoodFallbackCandidate(element) {
+  if (!(element instanceof HTMLElement)) return false;
+  if (element.closest(SKIP_SELECTOR)) return false;
+  if (hasLiveTranslationState(element)) return false;
+  if (
+    element.closest("header, nav, [role='navigation'], .d-header, .navigation-container, .nav-pills, .category-breadcrumb") &&
+    !isNavigationLikeElement(element)
+  ) {
+    return false;
+  }
+  if (!isActuallyVisible(element)) return false;
+  if (isRedundantInlineCandidate(element)) return false;
+  if (isContainerWithOwnReadableChildren(element)) return false;
+
+  const text = getCandidateText(element);
+  if (!text) return false;
+  if (text.length > getMaxBlockChars()) return false;
+  if (shouldSkipLanguageLabel(text, element)) return false;
+  if (/^[\d\s.,:;!?()[\]{}'"`~@#$%^&*+=|\\/<>-]+$/.test(text)) return false;
+  if (shouldSkipTargetLanguageText(text)) return false;
+
+  if (isHeadingElement(element)) return text.length >= 3;
+  return text.length >= 12;
+}
+
+function hasLiveTranslationState(element) {
+  if (!(element instanceof HTMLElement)) return false;
+  const hasMarker = element.dataset.lltTranslated === "1";
+  if (!hasMarker) return false;
+  const translationElement = findTranslationElement(element);
+  if (translationElement) return true;
+
+  element.removeAttribute("data-lltTranslated");
+  element.removeAttribute("data-llt-translated");
+  element.removeAttribute("data-llt-original-display");
+  element.removeAttribute("data-llt-translation-id");
+  return false;
+}
+
+function shouldSkipLanguageLabel(text, element) {
+  const normalized = normalizeText(text).toLowerCase();
+  if (!normalized) return false;
+
+  const labelMap = {
+    ko: ["ko", "kor", "korean", "한국어", "한글"],
+    en: ["en", "eng", "english", "영어"],
+    ja: ["ja", "jp", "jpn", "japanese", "일본어"],
+    zh: ["zh", "cn", "chi", "zho", "chinese", "중국어", "中文"],
+    es: ["es", "spa", "spanish", "espanol", "español", "스페인어"]
+  };
+
+  const target = getTargetLanguageCode();
+  const targetLabels = target ? (labelMap[target] || []) : [];
+  if (targetLabels.includes(normalized)) {
+    return true;
+  }
+
+  if (normalized.length <= 3 && element.closest("[aria-label*='language' i], [title*='language' i], [lang]")) {
+    return true;
+  }
+
+  return false;
+}
+
+function isActuallyVisible(element) {
+  const style = getComputedStyle(element);
+  if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") return false;
+  if (Number(style.opacity) === 0) return false;
+  if (element.closest("noscript, template, [hidden], .hidden")) return false;
+  return true;
+}
+
+function shouldSkipTargetLanguageText(text) {
+  const target = getTargetLanguageCode();
+  if (!target) return false;
+
+  const detected = detectLanguageFromText(text);
+  return detected === target;
 }
 
 function insertBilingualTranslation(element, translation) {
@@ -338,17 +847,14 @@ function createTranslationElement(options = {}) {
 
   const lang = inferTargetLanguageCode();
   if (lang) translationElement.lang = lang;
+  translationElement.dataset.lltTargetLanguage = lang || String(STATE.settings?.targetLanguage || "").trim().toLowerCase();
 
   if (options.loading) {
     const spinner = document.createElement("span");
     spinner.className = "llt-spinner";
     spinner.setAttribute("aria-hidden", "true");
-
-    const label = document.createElement("span");
-    label.className = "llt-loading-text";
-    label.textContent = "번역 중...";
-
-    translationElement.append(spinner, label);
+    translationElement.setAttribute("aria-label", "번역 중");
+    translationElement.append(spinner);
   }
 
   return translationElement;
@@ -388,7 +894,7 @@ function placeTranslationElement(element, translationElement) {
       translationElement.classList.add("llt-clickable-by-parent");
     }
     appendInlineTranslation(placement.target, translationElement);
-  } else if (isInlineElement(element) || isContainedBlockElement(element)) {
+  } else if (isInlineElement(element)) {
     translationElement.classList.add("llt-inline");
     appendInlineTranslation(element, translationElement);
   } else {
@@ -467,8 +973,7 @@ function findTranslationElement(element) {
     placement.mode === "title-inline" ||
     placement.mode === "compact-label" ||
     placement.mode === "inside-google-title-link" ||
-    isInlineElement(element) ||
-    isContainedBlockElement(element)
+    isInlineElement(element)
   ) {
     const children = Array.from(element.children);
     return children.find((child) => child.classList.contains("llt-translation"));
@@ -509,6 +1014,48 @@ function clearLoadingTranslations() {
       element.removeAttribute("data-llt-translation-id");
     }
   });
+}
+
+function hasExistingTranslations() {
+  return document.querySelector(".llt-translation") instanceof HTMLElement;
+}
+
+function getExistingTranslationLanguage() {
+  const translationElement = document.querySelector(".llt-translation:not(.llt-loading)");
+  if (!(translationElement instanceof HTMLElement)) return "";
+  return String(
+    translationElement.dataset.lltTargetLanguage ||
+    translationElement.getAttribute("lang") ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
+}
+
+function syncExistingTranslationState() {
+  const loadingCount = document.querySelectorAll(".llt-translation.llt-loading").length;
+  const translationCount = document.querySelectorAll(".llt-translation:not(.llt-loading)").length;
+
+  if (!loadingCount && !translationCount) {
+    STATE.translated = false;
+    return;
+  }
+
+  if (loadingCount && !translationCount) {
+    clearLoadingTranslations();
+    STATE.translated = false;
+    return;
+  }
+
+  const targetLanguage = getTargetLanguageCode();
+  const existingLanguage = getExistingTranslationLanguage();
+  if (targetLanguage && existingLanguage && targetLanguage !== existingLanguage) {
+    clearTranslations();
+    STATE.translated = false;
+    return;
+  }
+
+  STATE.translated = true;
 }
 
 function showSelectionTranslation(text) {
@@ -664,6 +1211,53 @@ function isLinkElement(element) {
   return element.tagName === "A";
 }
 
+function isRedundantInlineCandidate(element) {
+  if (!(isLinkElement(element) || element.tagName === "BUTTON" || element.getAttribute("role") === "button")) {
+    return false;
+  }
+
+  if (isGoogleSearchPage()) return false;
+  if (element.closest("nav, header, [role='navigation'], .d-header, .category-breadcrumb, .navigation-container, .nav-pills")) {
+    return false;
+  }
+
+  const parentBlock = element.parentElement?.closest([
+    BLOCK_ELEMENT_SELECTOR,
+    ".cooked",
+    "[itemprop='mainContentOfPage']"
+  ].join(","));
+
+  if (!parentBlock || parentBlock === element) {
+    return false;
+  }
+
+  if (element.matches(".anchor, .hashtag-cooked, .mention")) {
+    return true;
+  }
+
+  const parentText = extractElementText(parentBlock);
+  const ownText = extractElementText(element);
+  if (!ownText || !parentText) return false;
+
+  const normalizedParentText = normalizeText(parentText);
+  const normalizedOwnText = normalizeText(ownText);
+  if (!normalizedOwnText || !normalizedParentText) return false;
+
+  if (isHeadingElement(parentBlock) && parentBlock !== element) {
+    return true;
+  }
+
+  if (normalizedParentText === normalizedOwnText) {
+    return true;
+  }
+
+  if (normalizedParentText.includes(normalizedOwnText)) {
+    return true;
+  }
+
+  return normalizedParentText.length >= normalizedOwnText.length;
+}
+
 function getTranslationPlacement(element) {
   if (isGoogleSearchResultTitle(element)) {
     if (shouldPlaceTitleBeside(element)) {
@@ -731,8 +1325,17 @@ function shouldPlaceTitleBeside(element) {
   if (isGoogleSearchResultTitle(element)) return true;
 
   const text = extractElementText(element);
-  if (text.length <= 28) return true;
-  if (text.length > 42) return false;
+  const normalizedText = normalizeText(text);
+  const wordCount = normalizedText ? normalizedText.split(/\s+/).length : 0;
+
+  if (isHeadingElement(element)) {
+    return false;
+  }
+
+  if (!isHeadingElement(element)) {
+    if (text.length <= 28) return true;
+    if (text.length > 42) return false;
+  }
 
   const rect = element.getBoundingClientRect();
   return !rect.width || rect.width < Math.min(window.innerWidth * 0.55, 520);
@@ -800,12 +1403,8 @@ function isShortLabelText(text) {
   return /[\p{L}\p{N}]/u.test(normalized);
 }
 
-function isContainedBlockElement(element) {
-  return ["LI", "TD", "TH"].includes(element.tagName);
-}
-
 function isContainerWithOwnReadableChildren(element) {
-  if (!["LI", "TD", "TH", "DIV"].includes(element.tagName)) return false;
+  if (!["LI", "TD", "TH", "DIV", "SECTION", "ARTICLE", "MAIN"].includes(element.tagName)) return false;
   if (hasReadableDirectText(element)) return false;
 
   return Array.from(element.querySelectorAll(CHILD_TEXT_SELECTOR)).some((child) => {
@@ -825,19 +1424,11 @@ function hasReadableDirectText(element) {
 }
 
 function buildTranslationInput(element) {
-  const links = getElementLinks(element);
-  if (!links.length) {
-    return { text: extractElementText(element), links };
-  }
+  return { text: getCandidateText(element), links: [] };
+}
 
-  let text = extractElementText(element);
-  links.forEach((link, index) => {
-    const linkText = normalizeText(link.text);
-    if (!linkText) return;
-    text = text.replace(new RegExp(escapeRegExp(linkText), "u"), `[[LINK_${index}]]${linkText}[[/LINK_${index}]]`);
-  });
-
-  return { text, links };
+function hasProtectedPlaceholders(text) {
+  return false;
 }
 
 function renderTranslationContent(container, translation, sourceElement) {
@@ -849,50 +1440,7 @@ function renderTranslationContent(container, translation, sourceElement) {
     return;
   }
 
-  const links = getElementLinks(sourceElement);
-  if (!links.length) {
-    container.textContent = cleanupLinkMarkers(normalizedTranslation);
-    return;
-  }
-
-  let lastIndex = 0;
-  let match;
-  let matched = false;
-
-  LINK_PAIR_PATTERN.lastIndex = 0;
-  while ((match = LINK_PAIR_PATTERN.exec(normalizedTranslation)) !== null) {
-    matched = true;
-    appendText(container, cleanupLinkMarkers(normalizedTranslation.slice(lastIndex, match.index)));
-
-    const linkInfo = links[Number(match[1])];
-    if (linkInfo?.href) {
-      const anchor = document.createElement("a");
-      anchor.className = "llt-translated-link";
-      anchor.href = linkInfo.href;
-      anchor.target = linkInfo.target || "";
-      anchor.rel = linkInfo.rel || "noopener noreferrer";
-      anchor.textContent = cleanupLinkMarkers(match[2]) || linkInfo.text;
-      container.appendChild(anchor);
-    } else {
-      appendText(container, cleanupLinkMarkers(match[2]));
-    }
-
-    lastIndex = LINK_PAIR_PATTERN.lastIndex;
-  }
-
-  appendText(container, cleanupLinkMarkers(normalizedTranslation.slice(lastIndex)));
-
-  const fallback = getDominantLink(links);
-  if (!matched && fallback?.href) {
-    container.replaceChildren();
-    const anchor = document.createElement("a");
-    anchor.className = "llt-translated-link";
-    anchor.href = fallback.href;
-    anchor.target = fallback.target || "";
-    anchor.rel = fallback.rel || "noopener noreferrer";
-    anchor.textContent = cleanupLinkMarkers(normalizedTranslation);
-    container.appendChild(anchor);
-  }
+  renderPlainMarkedText(container, normalizedTranslation);
 }
 
 function getElementLinks(element) {
@@ -904,6 +1452,7 @@ function getElementLinks(element) {
       : Array.from(element.querySelectorAll("a[href]"));
 
   return candidates
+    .filter((anchor) => !shouldIgnoreTranslationLink(anchor, element))
     .map((anchor) => ({
       href: anchor.href,
       target: anchor.target,
@@ -915,13 +1464,81 @@ function getElementLinks(element) {
 
 function getLinkText(anchor, sourceElement) {
   if (anchor.contains(sourceElement) && anchor !== sourceElement) {
-    return extractElementText(sourceElement);
+    return getCandidateText(sourceElement);
   }
   return extractElementText(anchor);
 }
 
+function shouldIgnoreTranslationLink(anchor, sourceElement) {
+  if (!(anchor instanceof HTMLAnchorElement)) return true;
+  if (!(sourceElement instanceof HTMLElement)) return false;
+
+  if (isHeadingElement(sourceElement)) {
+    if (isIgnoredHeadingLink(anchor)) return true;
+
+    try {
+      const url = new URL(anchor.href, location.href);
+      if (url.origin === location.origin && url.pathname === location.pathname && url.hash) {
+        return true;
+      }
+    } catch {
+      // Ignore URL parsing failures and preserve the link.
+    }
+  }
+
+  return false;
+}
+
+function getCandidateText(element) {
+  if (isHeadingElement(element)) {
+    const headingText = extractHeadingText(element);
+    if (headingText) return headingText;
+  }
+  return extractElementText(element);
+}
+
+function extractHeadingText(element) {
+  const ownText = extractElementText(element);
+  const headingLinks = Array.from(element.querySelectorAll("a[href]"))
+    .filter((link) => !isIgnoredHeadingLink(link))
+    .map((link) => normalizeText(link.innerText || link.textContent || ""))
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+
+  if (headingLinks.length) {
+    const bestLinkText = headingLinks[0];
+    if (!ownText || ownText === bestLinkText || ownText.includes(bestLinkText)) {
+      return bestLinkText;
+    }
+  }
+
+  return ownText;
+}
+
+function isIgnoredHeadingLink(link) {
+  if (!(link instanceof HTMLElement)) return true;
+  const ariaLabel = String(link.getAttribute("aria-label") || "").trim().toLowerCase();
+  if (ariaLabel === "heading link") return true;
+  if (link.matches(".anchor")) return true;
+  return false;
+}
+
 function getDominantLink(links) {
   return links.length === 1 ? links[0] : null;
+}
+
+function shouldUseWholeTranslationLinkFallback(sourceElement) {
+  if (!(sourceElement instanceof HTMLElement)) return false;
+  if (isLinkElement(sourceElement)) return true;
+
+  const text = getCandidateText(sourceElement);
+  if (!isShortLabelText(text)) return false;
+
+  if (isHeadingElement(sourceElement)) return true;
+  if (sourceElement.tagName === "BUTTON") return true;
+  if (sourceElement.matches("[role='button'], .topic-title, .fancy-title, .raw-topic-link, a.title")) return true;
+
+  return false;
 }
 
 function appendText(container, text) {
@@ -929,13 +1546,45 @@ function appendText(container, text) {
 }
 
 function cleanupLinkMarkers(text) {
-  return normalizeLinkMarkerSyntax(text).replace(LINK_MARKER_PATTERN, "");
+  return normalizeLinkMarkerSyntax(text)
+    .replace(TERM_MARKER_PATTERN, "");
 }
 
 function normalizeLinkMarkerSyntax(text) {
   return String(text || "")
-    .replace(/\[\[\s*LINK_(\d+)\s*]]/gi, (_, index) => `[[LINK_${index}]]`)
-    .replace(/\[\[\s*\/\s*LINK_(\d+)\s*]]/gi, (_, index) => `[[/LINK_${index}]]`);
+    .replace(/\[\[\s*TERM_(\d+)\s*]]/gi, (_, index) => `[[TERM_${index}]]`)
+    .replace(/\[\[\s*\/\s*TERM_(\d+)\s*]]/gi, (_, index) => `[[/TERM_${index}]]`);
+}
+
+function renderPlainMarkedText(container, text) {
+  const normalized = normalizeLinkMarkerSyntax(text);
+  let cursor = 0;
+  let match;
+  let rendered = false;
+
+  TERM_PAIR_PATTERN.lastIndex = 0;
+  while ((match = TERM_PAIR_PATTERN.exec(normalized)) !== null) {
+    rendered = true;
+    appendText(container, cleanupLinkMarkers(normalized.slice(cursor, match.index)));
+    appendText(container, cleanupLinkMarkers(match[2]));
+    cursor = TERM_PAIR_PATTERN.lastIndex;
+  }
+
+  if (!rendered) {
+    appendText(container, cleanupLinkMarkers(normalized));
+    return;
+  }
+
+  appendText(container, cleanupLinkMarkers(normalized.slice(cursor)));
+}
+
+function protectLiteralTerms(text) {
+  let nextIndex = 0;
+  return String(text || "").replace(PROTECTED_TERM_PATTERN, (match) => {
+    const normalized = normalizeText(match);
+    if (!normalized) return match;
+    return `[[TERM_${nextIndex++}]]${match}[[/TERM_${nextIndex - 1}]]`;
+  });
 }
 
 function escapeRegExp(text) {
@@ -943,7 +1592,38 @@ function escapeRegExp(text) {
 }
 
 function extractElementText(element) {
-  return normalizeText(element.innerText || element.textContent || "");
+  if (!(element instanceof HTMLElement)) return "";
+
+  const parts = [];
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (!parent) return NodeFilter.FILTER_REJECT;
+      if (shouldIgnoreTextParent(parent)) return NodeFilter.FILTER_REJECT;
+      const text = normalizeText(node.textContent || "");
+      return text ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    }
+  });
+
+  let current;
+  while ((current = walker.nextNode())) {
+    parts.push(current.textContent || "");
+  }
+
+  return normalizeText(parts.join(" "));
+}
+
+function shouldIgnoreTextParent(element) {
+  if (!(element instanceof HTMLElement)) return true;
+  if (element.closest(SKIP_SELECTOR)) return true;
+  if (element.closest(".anchor, .hashtag-icon-placeholder, svg, img, [aria-hidden='true'], .sr-only, .visually-hidden")) {
+    return true;
+  }
+
+  const label = String(element.getAttribute("aria-label") || "").trim().toLowerCase();
+  if (label === "heading link") return true;
+
+  return false;
 }
 
 function normalizeText(text) {
@@ -954,12 +1634,43 @@ function normalizeText(text) {
 }
 
 function inferTargetLanguageCode() {
+  return getTargetLanguageCode();
+}
+
+function getTargetLanguageCode() {
   const target = String(STATE.settings?.targetLanguage || "").trim().toLowerCase();
-  if (/^(ko|kor|korean|한국어|한글)$/.test(target)) return "ko";
-  if (/^(en|eng|english|영어)$/.test(target)) return "en";
-  if (/^(ja|jpn|japanese|일본어)$/.test(target)) return "ja";
-  if (/^(zh|zho|chi|chinese|중국어)$/.test(target)) return "zh";
+  if (["ko", "en", "ja", "zh", "es"].includes(target)) return target;
+  if (/^(kor|korean|한국어|한글)$/.test(target)) return "ko";
+  if (/^(eng|english|영어)$/.test(target)) return "en";
+  if (/^(jpn|japanese|일본어)$/.test(target)) return "ja";
+  if (/^(zho|chi|chinese|중국어)$/.test(target)) return "zh";
+  if (/^(spa|spanish|español|스페인어)$/.test(target)) return "es";
   return "";
+}
+
+function detectLanguageFromText(text) {
+  const normalized = normalizeText(text);
+  if (!normalized) return "";
+
+  if (/[가-힣]/.test(normalized)) return "ko";
+  if (/[\u3040-\u30ff]/.test(normalized)) return "ja";
+  if (/[\u4e00-\u9fff]/.test(normalized)) return "zh";
+
+  const latinWords = normalized.match(/[A-Za-zÀ-ÿ]+/g) || [];
+  if (!latinWords.length) return "";
+
+  const sample = normalized.toLowerCase();
+  const spanishHints = countMatches(sample, /\b(el|la|los|las|de|del|para|como|que|por|una|un|y|en)\b/g)
+    + countMatches(sample, /[áéíóúñ¿¡]/g);
+  const englishHints = countMatches(sample, /\b(the|and|with|that|this|from|you|your|for|page|guide|memory|forum)\b/g);
+
+  if (spanishHints >= englishHints + 2) return "es";
+  if (englishHints > 0) return "en";
+  return "";
+}
+
+function countMatches(text, pattern) {
+  return (String(text || "").match(pattern) || []).length;
 }
 
 function applyTranslationDisplaySettings(element) {
@@ -1016,6 +1727,16 @@ function chunkBlocks(items, maxItems, maxChars) {
 
   for (const item of items) {
     const itemChars = item.text.length;
+    if (hasProtectedPlaceholders(item.text)) {
+      if (current.length) {
+        chunks.push(current);
+        current = [];
+        currentChars = 0;
+      }
+      chunks.push([item]);
+      continue;
+    }
+
     if (current.length && (current.length >= maxItems || currentChars + itemChars > maxChars)) {
       chunks.push(current);
       current = [];
@@ -1070,8 +1791,12 @@ function installAutoTranslateMutationWatcher() {
   if (STATE.autoTranslateObserver || !document.documentElement) return;
 
   STATE.autoTranslateObserver = new MutationObserver(() => {
-    if (!STATE.settings?.autoTranslate || STATE.translated || STATE.translating) return;
     if (STATE.routeTimer) return;
+    if (STATE.translated) {
+      scheduleLiveTranslate();
+      return;
+    }
+    if (!STATE.settings?.autoTranslate || STATE.translating) return;
     scheduleAutoTranslate(0);
   });
 
@@ -1093,10 +1818,27 @@ function handleRouteChange() {
   hideSelectionBubble();
   removePageStatus();
   clearTimeout(STATE.routeTimer);
+  clearTimeout(STATE.liveTranslateTimer);
+  STATE.liveTranslateTimer = null;
 
   if (STATE.settings?.autoTranslate) {
     STATE.routeTimer = setTimeout(() => scheduleAutoTranslate(0), 900);
   }
+}
+
+function scheduleLiveTranslate() {
+  if (STATE.liveTranslateTimer) {
+    clearTimeout(STATE.liveTranslateTimer);
+  }
+
+  STATE.liveTranslateTimer = setTimeout(() => {
+    STATE.liveTranslateTimer = null;
+    if (!STATE.translated || STATE.translating) return;
+    if (!collectTranslatableBlocks().length) return;
+    translatePageBlocks({ incremental: true }).catch((error) => {
+      showPageStatus(getFriendlyTranslationError(error));
+    });
+  }, 350);
 }
 
 function scheduleAutoTranslate(attempt = 0) {
@@ -1125,4 +1867,97 @@ function cancelActivePageTranslation() {
   if (!extensionApi?.runtime?.id) return;
 
   sendExtensionMessage({ type: "CANCEL_TRANSLATION", scope: "page" }).catch(() => {});
+}
+
+function exposeDebugApi() {
+  const api = {
+    get state() {
+      return {
+        translated: STATE.translated,
+        translating: STATE.translating,
+        lastUrl: STATE.lastUrl,
+        settings: { ...STATE.settings }
+      };
+    },
+    toggle() {
+      return togglePageTranslation();
+    },
+    translate() {
+      if (STATE.translated) {
+        restorePage();
+      }
+      return translatePageBlocks({ incremental: false });
+    },
+    restore() {
+      restorePage();
+    },
+    setSettings(nextSettings = {}) {
+      STATE.settings = { ...STATE.settings, ...nextSettings };
+      applySettingsToExistingTranslations();
+      return { ...STATE.settings };
+    },
+    collect() {
+      return {
+        blocks: collectTranslatableBlocks().map((item) => ({
+          text: item.text,
+          count: item.elements.length,
+          tags: item.elements.map((element) => element.tagName)
+        })),
+        fallbackBlocks: collectFallbackBlocks().map((item) => ({
+          text: item.text,
+          count: item.elements.length,
+          tags: item.elements.map((element) => element.tagName)
+        })),
+        remaining: collectRemainingFallbackElements().map((element) => ({
+          tag: element.tagName,
+          text: buildTranslationInput(element).text
+        }))
+      };
+    },
+    dump(limit = 20) {
+      const data = this.collect();
+      const lines = [];
+      lines.push(`[blocks] ${data.blocks.length}`);
+      data.blocks.slice(0, limit).forEach((item, index) => {
+        lines.push(`${index + 1}. ${item.tags.join(",")} :: ${item.text}`);
+      });
+      lines.push("");
+      lines.push(`[fallbackBlocks] ${data.fallbackBlocks.length}`);
+      data.fallbackBlocks.slice(0, limit).forEach((item, index) => {
+        lines.push(`${index + 1}. ${item.tags.join(",")} :: ${item.text}`);
+      });
+      lines.push("");
+      lines.push(`[remaining] ${data.remaining.length}`);
+      data.remaining.slice(0, limit).forEach((item, index) => {
+        lines.push(`${index + 1}. ${item.tag} :: ${item.text}`);
+      });
+
+      let panel = document.querySelector("#llt-debug-dump");
+      if (!panel) {
+        panel = document.createElement("pre");
+        panel.id = "llt-debug-dump";
+        panel.dataset.lltSkip = "1";
+        panel.style.position = "fixed";
+        panel.style.right = "12px";
+        panel.style.bottom = "12px";
+        panel.style.zIndex = "2147483647";
+        panel.style.maxWidth = "min(720px, 75vw)";
+        panel.style.maxHeight = "50vh";
+        panel.style.overflow = "auto";
+        panel.style.padding = "12px";
+        panel.style.margin = "0";
+        panel.style.borderRadius = "10px";
+        panel.style.background = "rgba(17,24,39,0.94)";
+        panel.style.color = "#e5e7eb";
+        panel.style.font = "12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace";
+        panel.style.whiteSpace = "pre-wrap";
+        panel.style.boxShadow = "0 12px 32px rgba(0,0,0,0.35)";
+        document.documentElement.appendChild(panel);
+      }
+      panel.textContent = lines.join("\n");
+      return lines.join("\n");
+    }
+  };
+  window.localTranslatorDebug = api;
+  window.llt = api;
 }

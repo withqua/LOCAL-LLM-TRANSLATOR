@@ -4,8 +4,10 @@ const fields = {
   clearCache: document.querySelector("#clear-cache"),
   endpoint: document.querySelector("#endpoint"),
   model: document.querySelector("#model"),
+  sourceLanguage: document.querySelector("#source-language"),
   targetLanguage: document.querySelector("#target-language"),
   requestTimeoutMs: document.querySelector("#request-timeout-ms"),
+  requestDelayMs: document.querySelector("#request-delay-ms"),
   autoTranslate: document.querySelector("#auto-translate"),
   translationColor: document.querySelector("#translation-color"),
   translationDensity: document.querySelector("#translation-density"),
@@ -14,6 +16,7 @@ const fields = {
   translationOffsetX: document.querySelector("#translation-offset-x"),
   translationOffsetY: document.querySelector("#translation-offset-y"),
   chunkSize: document.querySelector("#chunk-size"),
+  maxBatchChars: document.querySelector("#max-batch-chars"),
   maxBlocks: document.querySelector("#max-blocks"),
   maxBlockChars: document.querySelector("#max-block-chars"),
   customPrompt: document.querySelector("#custom-prompt"),
@@ -51,8 +54,10 @@ fields.save.addEventListener("click", async () => {
   const settings = {
     endpoint: fields.endpoint.value.trim(),
     model: fields.model.value.trim(),
+    sourceLanguage: fields.sourceLanguage.value.trim(),
     targetLanguage: fields.targetLanguage.value.trim(),
     requestTimeoutMs: Number(fields.requestTimeoutMs.value) || 120000,
+    requestDelayMs: Number(fields.requestDelayMs.value) || 0,
     autoTranslate: fields.autoTranslate.checked,
     translationColor: fields.translationColor.value,
     translationDensity: fields.translationDensity.value,
@@ -61,6 +66,7 @@ fields.save.addEventListener("click", async () => {
     translationOffsetX: Number(fields.translationOffsetX.value) || 0,
     translationOffsetY: Number(fields.translationOffsetY.value) || 0,
     chunkSize: Number(fields.chunkSize.value) || 24,
+    maxBatchChars: Number(fields.maxBatchChars.value) || 5000,
     maxBlocks: Number(fields.maxBlocks.value) || 160,
     maxBlockChars: Number(fields.maxBlockChars.value) || 1600,
     customPrompt: fields.customPrompt.value.trim()
@@ -126,8 +132,10 @@ async function load() {
 function applySettings(settings) {
   fields.endpoint.value = settings.endpoint || "";
   fields.model.value = settings.model || "";
-  fields.targetLanguage.value = settings.targetLanguage || "";
+  fields.sourceLanguage.value = settings.sourceLanguage || "auto";
+  fields.targetLanguage.value = settings.targetLanguage || "ko";
   fields.requestTimeoutMs.value = settings.requestTimeoutMs || 120000;
+  fields.requestDelayMs.value = settings.requestDelayMs ?? 0;
   fields.autoTranslate.checked = Boolean(settings.autoTranslate);
   fields.translationColor.value = settings.translationColor || "#0f766e";
   fields.translationDensity.value = settings.translationDensity || "comfortable";
@@ -136,6 +144,7 @@ function applySettings(settings) {
   fields.translationOffsetX.value = settings.translationOffsetX ?? 0;
   fields.translationOffsetY.value = settings.translationOffsetY ?? 0;
   fields.chunkSize.value = settings.chunkSize || 24;
+  fields.maxBatchChars.value = settings.maxBatchChars || 5000;
   fields.maxBlocks.value = settings.maxBlocks || 160;
   fields.maxBlockChars.value = settings.maxBlockChars || 1600;
   fields.customPrompt.value = settings.customPrompt || "";

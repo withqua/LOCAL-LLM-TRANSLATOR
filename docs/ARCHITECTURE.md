@@ -1,56 +1,56 @@
-# Translation Architecture
+# 번역 아키텍처
 
-This extension translates visible webpage text with a local OpenAI-compatible LM Studio endpoint. It is intentionally built with plain JavaScript, HTML, and CSS: there is no build step, framework, bundler, or remote analytics.
+이 확장 프로그램은 로컬 OpenAI 호환 LM Studio 엔드포인트를 사용해 보이는 웹페이지 텍스트를 번역합니다. 의도적으로 순수 JavaScript, HTML, CSS로 구성되어 있으며, 빌드 단계, 프레임워크, 번들러, 원격 분석이 없습니다.
 
-## Runtime Surfaces
+## 런타임 영역
 
-- `popup.js` owns user actions: translate/restore the active tab, save settings, request current-domain auto-translate permission, and clear the in-memory translation cache.
-- `content.js` runs inside webpages. It finds translatable DOM elements, inserts loading and translated text, restores pages, watches SPA route changes, and handles selection bubbles.
-- `background.js` owns extension state, settings normalization, optional host permission registration, LM Studio requests, cancellation, context menu actions, keyboard commands, and the in-memory translation cache.
+- `popup.js`는 사용자 동작을 담당합니다. 활성 탭 번역/복원, 설정 저장, 현재 도메인 자동 번역 권한 요청, 메모리 번역 캐시 삭제를 처리합니다.
+- `content.js`는 웹페이지 내부에서 실행됩니다. 번역 가능한 DOM 요소를 찾고, 로딩 및 번역 텍스트를 삽입하며, 페이지 복원, SPA 경로 변경 감시, 선택 버블을 처리합니다.
+- `background.js`는 확장 프로그램 상태, 설정 정규화, 선택적 호스트 권한 등록, LM Studio 요청, 취소, 컨텍스트 메뉴 동작, 키보드 명령, 메모리 번역 캐시를 담당합니다.
 
-Browser APIs go through small compatibility wrappers so Chrome callback APIs and Firefox `browser.*` Promise APIs share the same code paths.
+브라우저 API는 작은 호환성 래퍼를 통해 Chrome 콜백 API와 Firefox `browser.*` Promise API가 같은 코드 경로를 공유하도록 합니다.
 
-## Translation Flow
+## 번역 흐름
 
-1. The popup, context menu, keyboard shortcut, or auto-translate registration sends a runtime message to the content script.
-2. `content.js` collects visible text blocks with `TEXT_SELECTOR`, then filters out unsafe or noisy candidates such as inputs, code blocks, existing translation UI, tiny elements, and parent containers that are better represented by child elements.
-3. The content script inserts a loading translation element beside each source element.
-4. The content script sends text batches to `background.js` with `TRANSLATE_TEXTS`.
-5. `background.js` checks the in-memory cache. Cache hits return immediately; misses are batched by character count and sent to LM Studio.
-6. LM Studio is prompted to return a JSON array in the same order. The background script parses that array, retries suspicious Korean mojibake-like outputs, stores successful results in memory, and returns translations.
-7. `content.js` replaces each matching loading element with the translated output.
+1. 팝업, 컨텍스트 메뉴, 키보드 단축키, 또는 자동 번역 등록이 콘텐츠 스크립트로 런타임 메시지를 보냅니다.
+2. `content.js`는 `TEXT_SELECTOR`로 보이는 텍스트 블록을 수집한 뒤, 입력 요소, 코드 블록, 기존 번역 UI, 매우 작은 요소, 자식 요소가 더 적합한 부모 컨테이너 같은 위험하거나 노이즈가 많은 후보를 제외합니다.
+3. 콘텐츠 스크립트가 각 원본 요소 옆에 로딩 번역 요소를 삽입합니다.
+4. 콘텐츠 스크립트가 `TRANSLATE_TEXTS`로 텍스트 배치를 `background.js`에 보냅니다.
+5. `background.js`가 메모리 캐시를 확인합니다. 캐시 적중은 즉시 반환하고, 미스는 글자 수 기준으로 배치해 LM Studio로 보냅니다.
+6. LM Studio에는 동일한 순서의 JSON 배열을 반환하도록 프롬프트합니다. 백그라운드 스크립트는 해당 배열을 파싱하고, 의심스러운 한국어 모지바케 결과를 재시도한 뒤, 성공 결과를 메모리에 저장하고 번역을 반환합니다.
+7. `content.js`가 각 로딩 요소를 해당 번역 결과로 교체합니다.
 
-Each inserted translation element is linked to its source element with a local `data-llt-translation-id` / `data-llt-source-id` pair. This prevents parent/child DOM structures, especially Discourse and Reddit layouts, from completing the wrong loading element or leaving `번역 중...` behind.
+삽입된 각 번역 요소는 로컬 `data-llt-translation-id` / `data-llt-source-id` 쌍으로 원본 요소와 연결됩니다. 이는 부모/자식 DOM 구조, 특히 Discourse와 Reddit 레이아웃에서 잘못된 로딩 요소가 완료되거나 `번역 중...`이 남는 문제를 방지합니다.
 
-## Placement Rules
+## 배치 규칙
 
-Most paragraphs and long text blocks receive a block translation below the source. Short navigation labels, category labels, tags, and buttons use compact inline placement such as `Guide /가이드`, without reducing the original font size.
+대부분의 문단과 긴 텍스트 블록은 원본 아래에 블록 번역을 배치합니다. 짧은 내비게이션 라벨, 카테고리 라벨, 태그, 버튼은 `Guide /가이드`처럼 компакт한 인라인 배치를 사용하며, 원래 글꼴 크기를 줄이지 않습니다.
 
-Link-heavy prose is translated as a whole when the parent element contains readable direct text. Inline links are marked with temporary `[[LINK_0]]` placeholders before sending to the model so the translated result can preserve links without using unsafe HTML injection.
+링크가 많은 문장은 부모 요소에 읽을 수 있는 직접 텍스트가 있을 때 전체를 한 덩어리로 번역합니다. 인라인 링크는 모델로 보내기 전에 `[[LINK_0]]` 같은 임시 플레이스홀더로 표시해, 안전하지 않은 HTML 주입 없이 번역 결과가 링크를 보존하도록 합니다.
 
-Reddit-specific guardrails skip narrow long labels and duplicate long text because Reddit often renders the same post title in multiple visible or layout-helper nodes. This avoids vertical, unreadable translations and repeated translated titles.
+Reddit 전용 가드레일은 좁고 긴 라벨과 중복 긴 텍스트를 건너뜁니다. Reddit은 동일한 게시물 제목을 여러 개의 보이는 노드나 레이아웃 보조 노드에 렌더링하는 경우가 많아서, 세로로 읽기 어려운 번역과 반복된 번역 제목을 방지합니다.
 
-## Cache Behavior
+## 캐시 동작
 
-The translation cache is memory-only. It lives in `background.js` as a `Map` and can hold up to 600 entries.
+번역 캐시는 메모리 전용입니다. `background.js`의 `Map`에 존재하며 최대 600개 항목을 보관할 수 있습니다.
 
-The cache key includes:
+캐시 키에는 다음이 포함됩니다:
 
-- model
-- target language
-- custom prompt
-- source text
+- 모델
+- 대상 언어
+- 사용자 프롬프트
+- 원문 텍스트
 
-Changing the model, target language, or prompt naturally avoids reusing old cached results. The popup's `메모리 캐시 삭제` button clears the current memory cache so bad model output is not reused during the same background-script lifetime.
+모델, 대상 언어, 프롬프트를 변경하면 기존 캐시 결과가 재사용되지 않습니다. 팝업의 `메모리 캐시 삭제` 버튼은 현재 메모리 캐시를 지워, 같은 백그라운드 스크립트 수명 동안 잘못된 모델 출력이 재사용되는 것을 막습니다.
 
-The extension does not persist translated page text to `chrome.storage.local`. If a previous development build wrote a legacy `translationCache` key, the current code removes it during install/update and when the memory cache is cleared.
+이 확장 프로그램은 번역된 페이지 텍스트를 `chrome.storage.local`에 저장하지 않습니다. 과거 개발 빌드가 레거시 `translationCache` 키를 저장했다면, 현재 코드는 설치/업데이트 시와 메모리 캐시가 삭제될 때 이를 제거합니다.
 
-## Privacy
+## 개인정보 보호
 
-Page text is sent only to the configured local OpenAI-compatible endpoint, normally LM Studio at `http://localhost:1234/v1/chat/completions`. Settings and auto-translate domain choices are stored locally through extension storage. No telemetry, account system, third-party analytics, or remote network calls are added.
+페이지 텍스트는 설정된 로컬 OpenAI 호환 엔드포인트로만 전송되며, 보통 LM Studio의 `http://localhost:1234/v1/chat/completions`입니다. 설정과 자동 번역 도메인 선택은 확장 스토리지에 로컬로 저장됩니다. 텔레메트리, 계정 시스템, 서드파티 분석, 원격 네트워크 호출은 추가되지 않습니다.
 
-## Failure Handling
+## 실패 처리
 
-Long translations keep a runtime port open so MV3 background service workers are less likely to shut down while LM Studio is still responding. If the runtime connection still closes, the content script cancels the active translation, removes loading placeholders, and shows a page status message instead of leaving stale loading UI.
+긴 번역은 런타임 포트를 열어 둬 MV3 백그라운드 서비스 워커가 LM Studio 응답 중 종료될 가능성을 낮춥니다. 런타임 연결이 여전히 닫히면, 콘텐츠 스크립트가 활성 번역을 취소하고 로딩 플레이스홀더를 제거한 뒤, 오래된 로딩 UI를 남기는 대신 페이지 상태 메시지를 표시합니다.
 
-If the model returns invalid JSON or the request times out, the current chunk is reset so the page can be retried.
+모델이 유효하지 않은 JSON을 반환하거나 요청이 타임아웃되면, 현재 청크를 리셋해 페이지를 다시 시도할 수 있게 합니다.
