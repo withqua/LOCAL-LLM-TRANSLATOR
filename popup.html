@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Local Translator</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Local Translator</h1>
+        <p>LM Studio</p>
+      </header>
+
+      <button id="toggle-page" class="primary-action" type="button">페이지 번역 / 복원</button>
+
+      <label class="toggle-row">
+        <span>새 페이지 자동 번역</span>
+        <input id="auto-translate" type="checkbox">
+      </label>
+
+      <label>
+        <span>번역 언어</span>
+        <input id="target-language" type="text" placeholder="Korean" autocomplete="off">
+      </label>
+
+      <label>
+        <span>LM Studio 엔드포인트</span>
+        <input id="endpoint" type="url" placeholder="http://localhost:1234/v1/chat/completions" spellcheck="false" autocomplete="off">
+      </label>
+
+      <label>
+        <span>모델</span>
+        <input id="model" type="text" placeholder="local-model" spellcheck="false" autocomplete="off">
+      </label>
+
+      <label>
+        <span>요청 제한 시간(ms)</span>
+        <input id="request-timeout-ms" type="number" min="10000" step="10000" placeholder="120000">
+      </label>
+
+      <section class="settings-group" aria-label="번역 표시 설정">
+        <div class="group-title">표시 품질</div>
+
+        <label>
+          <span>번역 색상</span>
+          <input id="translation-color" type="color" value="#0f766e">
+        </label>
+
+        <label>
+          <span>밀도</span>
+          <select id="translation-density">
+            <option value="comfortable">읽기 편하게</option>
+            <option value="compact">촘촘하게</option>
+          </select>
+        </label>
+
+        <label>
+          <span>번역 칸 폭</span>
+          <select id="translation-width">
+            <option value="content">내용에 맞춤</option>
+            <option value="full">결과 폭에 맞춤</option>
+          </select>
+        </label>
+
+        <label>
+          <span>제목 번역 위치</span>
+          <select id="title-placement">
+            <option value="auto">자동</option>
+            <option value="beside">항상 옆</option>
+            <option value="below">항상 아래</option>
+          </select>
+        </label>
+
+        <div class="two-column">
+          <label>
+            <span>가로 보정(px)</span>
+            <input id="translation-offset-x" type="number" min="-80" max="80" step="1" value="0">
+          </label>
+
+          <label>
+            <span>세로 보정(px)</span>
+            <input id="translation-offset-y" type="number" min="-80" max="80" step="1" value="0">
+          </label>
+        </div>
+      </section>
+
+      <section class="settings-group" aria-label="성능 설정">
+        <div class="group-title">성능 / 토큰</div>
+
+        <div class="two-column">
+          <label>
+            <span>청크 크기</span>
+            <input id="chunk-size" type="number" min="1" max="8" step="1" value="4">
+          </label>
+
+          <label>
+            <span>최대 블록</span>
+            <input id="max-blocks" type="number" min="20" max="400" step="10" value="160">
+          </label>
+        </div>
+
+        <label>
+          <span>블록당 최대 글자</span>
+          <input id="max-block-chars" type="number" min="240" max="4000" step="100" value="1600">
+        </label>
+      </section>
+
+      <label>
+        <span>프롬프트</span>
+        <textarea id="custom-prompt" rows="7" spellcheck="false"></textarea>
+      </label>
+
+      <button id="save" type="button">설정 저장</button>
+      <p id="status" role="status" aria-live="polite"></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
