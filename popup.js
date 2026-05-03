@@ -1,6 +1,7 @@
 const fields = {
   togglePage: document.querySelector("#toggle-page"),
   save: document.querySelector("#save"),
+  clearCache: document.querySelector("#clear-cache"),
   endpoint: document.querySelector("#endpoint"),
   model: document.querySelector("#model"),
   targetLanguage: document.querySelector("#target-language"),
@@ -59,7 +60,7 @@ fields.save.addEventListener("click", async () => {
     titlePlacement: fields.titlePlacement.value,
     translationOffsetX: Number(fields.translationOffsetX.value) || 0,
     translationOffsetY: Number(fields.translationOffsetY.value) || 0,
-    chunkSize: Number(fields.chunkSize.value) || 4,
+    chunkSize: Number(fields.chunkSize.value) || 24,
     maxBlocks: Number(fields.maxBlocks.value) || 160,
     maxBlockChars: Number(fields.maxBlockChars.value) || 1600,
     customPrompt: fields.customPrompt.value.trim()
@@ -94,6 +95,21 @@ fields.save.addEventListener("click", async () => {
   }
 });
 
+fields.clearCache.addEventListener("click", async () => {
+  setCacheClearing(true);
+
+  try {
+    const response = await sendRuntimeMessage({ type: "CLEAR_TRANSLATION_CACHE" });
+    if (!response?.ok) throw new Error(response?.error || "캐시 삭제 실패");
+
+    showStatus(`메모리 캐시 ${response.count || 0}개를 삭제했습니다.`);
+  } catch (error) {
+    showStatus(error.message || "캐시 삭제 실패", "error");
+  } finally {
+    setCacheClearing(false);
+  }
+});
+
 load();
 
 async function load() {
@@ -119,7 +135,7 @@ function applySettings(settings) {
   fields.titlePlacement.value = settings.titlePlacement || "auto";
   fields.translationOffsetX.value = settings.translationOffsetX ?? 0;
   fields.translationOffsetY.value = settings.translationOffsetY ?? 0;
-  fields.chunkSize.value = settings.chunkSize || 4;
+  fields.chunkSize.value = settings.chunkSize || 24;
   fields.maxBlocks.value = settings.maxBlocks || 160;
   fields.maxBlockChars.value = settings.maxBlockChars || 1600;
   fields.customPrompt.value = settings.customPrompt || "";
@@ -128,6 +144,11 @@ function applySettings(settings) {
 function setSaving(isSaving) {
   fields.save.disabled = isSaving;
   fields.save.textContent = isSaving ? "저장 중..." : "설정 저장";
+}
+
+function setCacheClearing(isClearing) {
+  fields.clearCache.disabled = isClearing;
+  fields.clearCache.textContent = isClearing ? "삭제 중..." : "메모리 캐시 삭제";
 }
 
 function showStatus(text, type = "success") {

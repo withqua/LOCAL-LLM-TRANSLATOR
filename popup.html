@@ -92,7 +92,7 @@
         <div class="two-column">
           <label>
             <span>청크 크기</span>
-            <input id="chunk-size" type="number" min="1" max="8" step="1" value="4">
+            <input id="chunk-size" type="number" min="1" max="24" step="1" value="24">
           </label>
 
           <label>
@@ -113,6 +113,7 @@
       </label>
 
       <button id="save" type="button">설정 저장</button>
+      <button id="clear-cache" class="secondary-action" type="button">메모리 캐시 삭제</button>
       <p id="status" role="status" aria-live="polite"></p>
     </main>
     <script src="popup.js"></script>

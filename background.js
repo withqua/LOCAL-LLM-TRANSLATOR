@@ -2,9 +2,9 @@ const DEFAULT_SETTINGS = {
   endpoint: "http://localhost:1234/v1/chat/completions",
   model: "local-model",
   targetLanguage: "Korean",
-  requestDelayMs: 120,
-  maxBatchChars: 1800,
-  chunkSize: 4,
+  requestDelayMs: 0,
+  maxBatchChars: 5000,
+  chunkSize: 24,
   maxBlocks: 160,
   maxBlockChars: 1600,
   requestTimeoutMs: 120000,
@@ -21,6 +21,7 @@ const DEFAULT_SETTINGS = {
 };
 
 const MAX_CACHE_ITEMS = 600;
+const LEGACY_CACHE_STORAGE_KEY = "translationCache";
 const LINK_MARKER_PATTERN = /\[\[\s*\/?\s*LINK_(?:\d+|N)\s*]]/gi;
 const LITERAL_LINK_MARKER_PATTERN = /\[\[\s*\/?\s*LINK_N\s*]]/gi;
 const LEGACY_DEFAULT_PROMPTS = [
@@ -36,6 +37,7 @@ extensionApi.runtime.onInstalled.addListener(async () => {
   const stored = await storageGet(Object.keys(DEFAULT_SETTINGS));
   const settings = normalizeSettings(stored);
   await storageSet(settings);
+  await storageRemove(LEGACY_CACHE_STORAGE_KEY).catch(() => {});
   await syncAutoTranslateContentScripts(settings);
 
   await contextMenusRemoveAll();
@@ -108,7 +110,19 @@ extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "CLEAR_TRANSLATION_CACHE") {
+    clearTranslationCache()
+      .then((count) => sendResponse({ ok: true, count }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
   return false;
+});
+
+extensionApi.runtime.onConnect.addListener((port) => {
+  if (port.name !== "llt-translation") return;
+  port.onDisconnect.addListener(() => {});
 });
 
 async function getSettings(pageUrl) {
@@ -152,14 +166,24 @@ async function saveSettings(rawSettings, pageUrl) {
 
 function normalizeSettings(settings = {}) {
   const merged = { ...DEFAULT_SETTINGS, ...settings };
+  const requestDelayMs = Number(merged.requestDelayMs) === 120
+    ? DEFAULT_SETTINGS.requestDelayMs
+    : clampNumber(merged.requestDelayMs, DEFAULT_SETTINGS.requestDelayMs, 0, 5000);
+  const maxBatchChars = Number(merged.maxBatchChars) === 1800
+    ? DEFAULT_SETTINGS.maxBatchChars
+    : clampNumber(merged.maxBatchChars, DEFAULT_SETTINGS.maxBatchChars, 300, 12000);
+  const chunkSize = Number(merged.chunkSize) === 4 || Number(merged.chunkSize) === 12
+    ? DEFAULT_SETTINGS.chunkSize
+    : clampInteger(merged.chunkSize, DEFAULT_SETTINGS.chunkSize, 1, 24);
+
   return {
     ...merged,
     endpoint: String(merged.endpoint || "").trim() || DEFAULT_SETTINGS.endpoint,
     model: String(merged.model || "").trim() || DEFAULT_SETTINGS.model,
     targetLanguage: String(merged.targetLanguage || "").trim() || DEFAULT_SETTINGS.targetLanguage,
-    requestDelayMs: clampNumber(merged.requestDelayMs, DEFAULT_SETTINGS.requestDelayMs, 0, 5000),
-    maxBatchChars: clampNumber(merged.maxBatchChars, DEFAULT_SETTINGS.maxBatchChars, 300, 6000),
-    chunkSize: clampInteger(merged.chunkSize, DEFAULT_SETTINGS.chunkSize, 1, 8),
+    requestDelayMs,
+    maxBatchChars,
+    chunkSize,
     maxBlocks: clampInteger(merged.maxBlocks, DEFAULT_SETTINGS.maxBlocks, 20, 400),
     maxBlockChars: clampInteger(merged.maxBlockChars, DEFAULT_SETTINGS.maxBlockChars, 240, 4000),
     requestTimeoutMs: clampNumber(merged.requestTimeoutMs, DEFAULT_SETTINGS.requestTimeoutMs, 10000, 600000),
@@ -273,6 +297,10 @@ function storageGet(keys) {
 
 function storageSet(items) {
   return callExtensionApi(extensionApi.storage.local.set.bind(extensionApi.storage.local), items);
+}
+
+function storageRemove(keys) {
+  return callExtensionApi(extensionApi.storage.local.remove.bind(extensionApi.storage.local), keys);
 }
 
 function contextMenusRemoveAll() {
@@ -553,11 +581,24 @@ function cacheKey(text, settings) {
 }
 
 function rememberTranslation(key, value) {
+  if (!value) return false;
+
+  const previous = translationCache.get(key);
+  if (previous === value) return false;
+
   if (!translationCache.has(key) && translationCache.size >= MAX_CACHE_ITEMS) {
     const oldestKey = translationCache.keys().next().value;
     translationCache.delete(oldestKey);
   }
   translationCache.set(key, value);
+  return true;
+}
+
+async function clearTranslationCache() {
+  const count = translationCache.size;
+  translationCache.clear();
+  await storageRemove(LEGACY_CACHE_STORAGE_KEY).catch(() => {});
+  return count;
 }
 
 function normalizeModelTranslation(text) {

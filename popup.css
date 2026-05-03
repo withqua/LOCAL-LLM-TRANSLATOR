@@ -134,6 +134,16 @@ button:disabled {
   min-height: 40px;
 }
 
+.secondary-action {
+  border: 1px solid #d4d4d8;
+  color: #3f3f46;
+  background: #ffffff;
+}
+
+.secondary-action:hover {
+  background: #f4f4f5;
+}
+
 .settings-group {
   display: grid;
   gap: 10px;
@@ -200,5 +210,15 @@ button:disabled {
 
   .group-title {
     color: #f4f4f5;
+  }
+
+  .secondary-action {
+    border-color: #52525b;
+    color: #f4f4f5;
+    background: #27272a;
+  }
+
+  .secondary-action:hover {
+    background: #3f3f46;
   }
 }

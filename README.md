@@ -137,8 +137,12 @@ This is intentionally small. It avoids PDF, video subtitles, OCR, account system
 
 Google Search result titles are handled separately from normal links so the translated title stays beside the original title instead of being pushed above it by Google's result layout. On other sites, short headings are placed inline automatically, while longer headings stay below for readability.
 
+For implementation details, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 ## 참고
 
 이 확장은 의도적으로 작게 유지됩니다. PDF, 비디오 자막, OCR, 계정 시스템, 텔레메트리, 특정 서비스 전용 헤더 트릭은 포함하지 않습니다.
 
 Google 검색 결과 제목은 일반 링크와 분리 처리하여, 번역 제목이 검색 결과 레이아웃 때문에 위로 밀리지 않고 원문 옆에 남도록 합니다. 다른 사이트에서는 짧은 제목은 자동으로 인라인 배치하고, 긴 제목은 가독성을 위해 아래에 배치합니다.
+
+구현 방식은 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)에 정리되어 있습니다.

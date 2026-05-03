@@ -97,8 +97,30 @@
   vertical-align: baseline !important;
 }
 
+.llt-translation.llt-compact-label {
+  display: inline !important;
+  margin: 0 0 0 0.08em !important;
+  padding: 0 !important;
+  border-left: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  font-size: inherit !important;
+  font-weight: inherit !important;
+  line-height: inherit !important;
+  white-space: nowrap !important;
+  vertical-align: baseline !important;
+  overflow-wrap: normal !important;
+}
+
 .llt-inline-spacer {
   display: inline !important;
+}
+
+.llt-compact-separator {
+  margin-left: 0.08em !important;
+  color: currentColor !important;
+  font-size: inherit !important;
+  opacity: 0.72 !important;
 }
 
 .llt-translation.llt-block.llt-loading {
