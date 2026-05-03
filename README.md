@@ -82,7 +82,7 @@ http://localhost:1234/v1/chat/completions
 
 ## Install Firefox
 
-1. Run:
+1. Type and run:
 
 ```sh
 node scripts/prepare-firefox.mjs
@@ -92,6 +92,8 @@ node scripts/prepare-firefox.mjs
 3. Go to `about:debugging#/runtime/this-firefox`.
 4. Click "Load Temporary Add-on".
 5. Select `dist/firefox/manifest.json`.
+
+Note: Firefox loads from `dist/firefox`, so re-run the script whenever `manifest.firefox.json` changes.
 
 ## 설치 Chrome
 
@@ -103,7 +105,7 @@ node scripts/prepare-firefox.mjs
 
 ## 설치 Firefox
 
-1. 실행합니다:
+1. 아래 명령을 입력합니다:
 
 ```sh
 node scripts/prepare-firefox.mjs
@@ -113,6 +115,8 @@ node scripts/prepare-firefox.mjs
 3. `about:debugging#/runtime/this-firefox`로 이동합니다.
 4. "Load Temporary Add-on"을 클릭합니다.
 5. `dist/firefox/manifest.json`을 선택합니다.
+
+참고: Firefox는 `dist/firefox`를 로드하므로 `manifest.firefox.json`을 수정한 뒤에는 스크립트를 다시 실행해야 합니다.
 
 
 ## Use

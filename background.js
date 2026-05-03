@@ -34,6 +34,7 @@ const translationCache = new Map();
 const activeTranslationControllers = new Map();
 const extensionApi = globalThis.browser || globalThis.chrome;
 const USES_PROMISE_API = typeof globalThis.browser !== "undefined";
+const registeredContentScripts = new Map();
 
 extensionApi.runtime.onInstalled.addListener(async () => {
   const stored = await storageGet(Object.keys(DEFAULT_SETTINGS));
@@ -321,23 +322,74 @@ function permissionsRemove(permissions) {
 }
 
 function scriptingGetRegisteredContentScripts() {
-  return callExtensionApi(extensionApi.scripting.getRegisteredContentScripts.bind(extensionApi.scripting));
+  if (extensionApi.scripting?.getRegisteredContentScripts) {
+    return callExtensionApi(extensionApi.scripting.getRegisteredContentScripts.bind(extensionApi.scripting));
+  }
+
+  if (!extensionApi.contentScripts?.register) {
+    return Promise.resolve([]);
+  }
+
+  return Promise.resolve(
+    Array.from(registeredContentScripts.keys()).map((id) => ({ id }))
+  );
 }
 
-function scriptingRegisterContentScripts(scripts) {
-  return callExtensionApi(extensionApi.scripting.registerContentScripts.bind(extensionApi.scripting), scripts);
+async function scriptingRegisterContentScripts(scripts) {
+  if (extensionApi.scripting?.registerContentScripts) {
+    return callExtensionApi(extensionApi.scripting.registerContentScripts.bind(extensionApi.scripting), scripts);
+  }
+
+  if (!extensionApi.contentScripts?.register) return;
+
+  for (const script of scripts || []) {
+    if (!script?.matches?.length) continue;
+    const registration = await extensionApi.contentScripts.register({
+      matches: script.matches,
+      js: script.js,
+      css: script.css,
+      runAt: script.runAt || "document_idle"
+    });
+    if (script.id) {
+      registeredContentScripts.set(script.id, registration);
+    }
+  }
 }
 
-function scriptingUnregisterContentScripts(filter) {
-  return callExtensionApi(extensionApi.scripting.unregisterContentScripts.bind(extensionApi.scripting), filter);
+async function scriptingUnregisterContentScripts(filter) {
+  if (extensionApi.scripting?.unregisterContentScripts) {
+    return callExtensionApi(extensionApi.scripting.unregisterContentScripts.bind(extensionApi.scripting), filter);
+  }
+
+  if (!extensionApi.contentScripts?.register) return;
+
+  const ids = filter?.ids || [];
+  for (const id of ids) {
+    const registration = registeredContentScripts.get(id);
+    if (!registration) continue;
+    await registration.unregister();
+    registeredContentScripts.delete(id);
+  }
 }
 
 function scriptingInsertCSS(details) {
-  return callExtensionApi(extensionApi.scripting.insertCSS.bind(extensionApi.scripting), details);
+  if (extensionApi.scripting?.insertCSS) {
+    return callExtensionApi(extensionApi.scripting.insertCSS.bind(extensionApi.scripting), details);
+  }
+
+  const tabId = details?.target?.tabId;
+  if (!tabId) return Promise.reject(new Error("Missing tab id."));
+  return callExtensionApi(extensionApi.tabs.insertCSS.bind(extensionApi.tabs), tabId, { file: "content.css" });
 }
 
 function scriptingExecuteScript(details) {
-  return callExtensionApi(extensionApi.scripting.executeScript.bind(extensionApi.scripting), details);
+  if (extensionApi.scripting?.executeScript) {
+    return callExtensionApi(extensionApi.scripting.executeScript.bind(extensionApi.scripting), details);
+  }
+
+  const tabId = details?.target?.tabId;
+  if (!tabId) return Promise.reject(new Error("Missing tab id."));
+  return callExtensionApi(extensionApi.tabs.executeScript.bind(extensionApi.tabs), tabId, { file: "content.js" });
 }
 
 function normalizeHexColor(value, fallback) {

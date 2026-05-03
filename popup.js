@@ -239,9 +239,21 @@ function sendRuntimeMessage(message) {
 }
 
 function scriptingInsertCSS(details) {
-  return callExtensionApi(extensionApi.scripting.insertCSS.bind(extensionApi.scripting), details);
+  if (extensionApi.scripting?.insertCSS) {
+    return callExtensionApi(extensionApi.scripting.insertCSS.bind(extensionApi.scripting), details);
+  }
+
+  const tabId = details?.target?.tabId;
+  if (!tabId) return Promise.reject(new Error("Missing tab id."));
+  return callExtensionApi(extensionApi.tabs.insertCSS.bind(extensionApi.tabs), tabId, { file: "content.css" });
 }
 
 function scriptingExecuteScript(details) {
-  return callExtensionApi(extensionApi.scripting.executeScript.bind(extensionApi.scripting), details);
+  if (extensionApi.scripting?.executeScript) {
+    return callExtensionApi(extensionApi.scripting.executeScript.bind(extensionApi.scripting), details);
+  }
+
+  const tabId = details?.target?.tabId;
+  if (!tabId) return Promise.reject(new Error("Missing tab id."));
+  return callExtensionApi(extensionApi.tabs.executeScript.bind(extensionApi.tabs), tabId, { file: "content.js" });
 }
