@@ -18,17 +18,17 @@ In the popup, set the model name to the exact LM Studio model name you are servi
 
 팝업의 모델 이름 입력란에는 LM Studio에서 서빙한 모델명을 정확히 입력해야 합니다.
 
-Personal Chrome extension sample for bilingual webpage translation with LM Studio.
+Personal Chrome, Chromium, and Firefox extension sample for bilingual webpage translation with LM Studio.
 
 ## 한국어
 
-LM Studio를 사용해 웹페이지를 이중 언어로 번역하는 개인용 Chrome 확장 샘플입니다.
+LM Studio를 사용해 웹페이지를 이중 언어로 번역하는 개인용 Chrome, Chromium, Firefox 확장 샘플입니다.
 
 ## Features
 
 - Whole page translation with original text plus translated text.
 - Selection translation from the context menu.
-- Optional auto-translate for every newly opened page.
+- Optional auto-translate for newly opened pages on domains you explicitly enable.
 - Custom translation prompt.
 - Adjustable translation color, density, width, title placement, and alignment offset.
 - Token controls for page chunk size, maximum translated blocks, and maximum characters per block.
@@ -39,7 +39,7 @@ LM Studio를 사용해 웹페이지를 이중 언어로 번역하는 개인용 C
 
 - 원문과 번역문을 함께 표시하는 전체 페이지 번역.
 - 컨텍스트 메뉴에서 선택 텍스트 번역.
-- 새로 열린 모든 페이지에 대한 자동 번역(옵션).
+- 명시적으로 켠 도메인의 새 페이지 자동 번역(옵션).
 - 번역 프롬프트 커스텀.
 - 번역 색상, 밀도, 너비, 제목 배치, 정렬 오프셋 조정.
 - 페이지 청크 크기, 최대 번역 블록 수, 블록당 최대 문자 수 토큰 제어.
@@ -72,23 +72,47 @@ http://localhost:1234/v1/chat/completions
 
 확장은 기본값으로 `model`을 `local-model`로 저장합니다. 보통 LM Studio에 모델이 하나만 열려 있으면 이 이름이 그대로 동작하지만, 팝업에서 변경할 수 있습니다.
 
-## Install
+## Install Chrome
 
 1. Open Chrome or a Chromium browser.
 2. Go to `chrome://extensions`.
 3. Enable Developer mode.
 4. Click "Load unpacked".
-5. Select folder:
+5. Select this project folder.
 
+## Install Firefox
 
-## 설치
+1. Run:
+
+```sh
+node scripts/prepare-firefox.mjs
+```
+
+2. Open Firefox.
+3. Go to `about:debugging#/runtime/this-firefox`.
+4. Click "Load Temporary Add-on".
+5. Select `dist/firefox/manifest.json`.
+
+## 설치 Chrome
 
 1. Chrome 또는 Chromium 브라우저를 엽니다.
 2. `chrome://extensions`로 이동합니다.
 3. 개발자 모드를 켭니다.
 4. "압축해제된 확장 프로그램을 로드"를 클릭합니다.
-5. 폴더를 선택합니다:
+5. 이 프로젝트 폴더를 선택합니다.
 
+## 설치 Firefox
+
+1. 실행합니다:
+
+```sh
+node scripts/prepare-firefox.mjs
+```
+
+2. Firefox를 엽니다.
+3. `about:debugging#/runtime/this-firefox`로 이동합니다.
+4. "Load Temporary Add-on"을 클릭합니다.
+5. `dist/firefox/manifest.json`을 선택합니다.
 
 
 ## Use
@@ -97,7 +121,7 @@ http://localhost:1234/v1/chat/completions
 - The popup also lets you edit the LM Studio endpoint, model, target language, timeout, auto-translate setting, prompt, display style, and token/performance limits.
 - Use `Alt+T` to translate or restore the current page.
 - Select text, right-click, then choose `선택한 문장 번역`.
-- Turn on `Auto translate new pages` if you want every new page to translate automatically.
+- Turn on domain auto-translate on each site where you want newly opened pages on the same domain to translate automatically.
 
 ## 사용
 
@@ -105,7 +129,7 @@ http://localhost:1234/v1/chat/completions
 - 팝업에서 LM Studio 엔드포인트, 모델, 대상 언어, 타임아웃, 자동 번역 설정, 프롬프트, 표시 스타일, 토큰/성능 제한을 변경할 수 있습니다.
 - `Alt+T`로 현재 페이지를 번역/복원합니다.
 - 텍스트를 선택하고 우클릭한 뒤 `선택한 문장 번역`을 선택합니다.
-- 새 페이지를 자동으로 번역하려면 `Auto translate new pages`를 켭니다.
+- 같은 도메인의 새 페이지를 자동 번역하려면 해당 사이트에서 도메인 자동 번역을 켭니다. 다른 도메인은 그 도메인에서 다시 켜야 합니다.
 
 ## Notes
 

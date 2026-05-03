@@ -18,11 +18,21 @@ const fields = {
   customPrompt: document.querySelector("#custom-prompt"),
   status: document.querySelector("#status")
 };
+const extensionApi = globalThis.browser || globalThis.chrome;
+const USES_PROMISE_API = typeof globalThis.browser !== "undefined";
+let activeTab = null;
 
 fields.togglePage.addEventListener("click", async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const [tab] = await tabsQuery({ active: true, currentWindow: true });
   if (!tab?.id) {
     showStatus("활성 탭을 찾지 못했습니다.", "error");
+    return;
+  }
+
+  try {
+    await ensureContentScript(tab.id);
+  } catch {
+    showStatus("이 페이지에서는 사용할 수 없습니다.", "error");
     return;
   }
 
@@ -36,6 +46,7 @@ fields.togglePage.addEventListener("click", async () => {
 });
 
 fields.save.addEventListener("click", async () => {
+  const pageUrl = activeTab?.url || "";
   const settings = {
     endpoint: fields.endpoint.value.trim(),
     model: fields.model.value.trim(),
@@ -54,17 +65,22 @@ fields.save.addEventListener("click", async () => {
     customPrompt: fields.customPrompt.value.trim()
   };
 
-  setSaving(true);
-
   try {
-    const saved = await chrome.runtime.sendMessage({ type: "SAVE_SETTINGS", settings });
+    const permissionRequest = requestAutoTranslatePermission(settings.autoTranslate, pageUrl);
+    setSaving(true);
+    await permissionRequest;
+
+    const saved = await sendRuntimeMessage({ type: "SAVE_SETTINGS", settings, pageUrl });
     if (!saved?.ok) throw new Error(saved?.error || "설정 저장 실패");
 
     applySettings(saved.settings || settings);
 
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) {
-      await sendTabMessage(tab.id, {
+    if (activeTab?.id) {
+      if (saved.settings?.autoTranslate) {
+        await ensureContentScript(activeTab.id);
+      }
+
+      await sendTabMessage(activeTab.id, {
         type: "SET_SETTINGS",
         settings: saved.settings || settings
       });
@@ -82,7 +98,8 @@ load();
 
 async function load() {
   try {
-    const settings = await chrome.runtime.sendMessage({ type: "GET_SETTINGS" });
+    [activeTab] = await tabsQuery({ active: true, currentWindow: true });
+    const settings = await sendRuntimeMessage({ type: "GET_SETTINGS", pageUrl: activeTab?.url || "" });
     if (settings?.error) throw new Error(settings.error);
     applySettings(settings);
   } catch (error) {
@@ -126,14 +143,75 @@ function showStatus(text, type = "success") {
 }
 
 function sendTabMessage(tabId, message) {
-  return new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId, message, () => {
-      if (chrome.runtime.lastError) {
-        resolve({ ok: false, error: chrome.runtime.lastError.message });
+  return callExtensionApi(extensionApi.tabs.sendMessage.bind(extensionApi.tabs), tabId, message)
+    .then((response) => response || { ok: true })
+    .catch((error) => ({ ok: false, error: error.message }));
+}
+
+async function ensureContentScript(tabId) {
+  const ping = await sendTabMessage(tabId, { type: "PING" });
+  if (ping.ok) return;
+
+  await scriptingInsertCSS({ target: { tabId }, files: ["content.css"] });
+  await scriptingExecuteScript({ target: { tabId }, files: ["content.js"] });
+}
+
+function getOriginPattern(pageUrl) {
+  try {
+    const url = new URL(pageUrl || "");
+    if (!["http:", "https:"].includes(url.protocol)) return "";
+    return `${url.protocol}//${url.hostname}/*`;
+  } catch {
+    return "";
+  }
+}
+
+function requestAutoTranslatePermission(autoTranslate, pageUrl) {
+  if (!autoTranslate) return Promise.resolve();
+
+  const origin = getOriginPattern(pageUrl);
+  if (!origin) {
+    return Promise.reject(new Error("이 페이지는 도메인별 자동 번역을 사용할 수 없습니다."));
+  }
+
+  return permissionsRequest({ origins: [origin] }).then((granted) => {
+    if (!granted) throw new Error("현재 도메인 권한이 필요합니다.");
+  });
+}
+
+function callExtensionApi(method, ...args) {
+  if (USES_PROMISE_API) {
+    return method(...args);
+  }
+
+  return new Promise((resolve, reject) => {
+    method(...args, (result) => {
+      const error = globalThis.chrome?.runtime?.lastError;
+      if (error) {
+        reject(new Error(error.message));
         return;
       }
-
-      resolve({ ok: true });
+      resolve(result);
     });
   });
+}
+
+function tabsQuery(queryInfo) {
+  return callExtensionApi(extensionApi.tabs.query.bind(extensionApi.tabs), queryInfo);
+}
+
+function permissionsRequest(permissions) {
+  return callExtensionApi(extensionApi.permissions.request.bind(extensionApi.permissions), permissions);
+}
+
+function sendRuntimeMessage(message) {
+  return callExtensionApi(extensionApi.runtime.sendMessage.bind(extensionApi.runtime), message);
+}
+
+function scriptingInsertCSS(details) {
+  return callExtensionApi(extensionApi.scripting.insertCSS.bind(extensionApi.scripting), details);
+}
+
+function scriptingExecuteScript(details) {
+  return callExtensionApi(extensionApi.scripting.executeScript.bind(extensionApi.scripting), details);
 }

@@ -9,6 +9,7 @@ const DEFAULT_SETTINGS = {
   maxBlockChars: 1600,
   requestTimeoutMs: 120000,
   autoTranslate: false,
+  autoTranslateOrigins: [],
   translationColor: "#0f766e",
   translationDensity: "comfortable",
   translationWidth: "content",
@@ -28,48 +29,57 @@ const LEGACY_DEFAULT_PROMPTS = [
 ];
 const translationCache = new Map();
 const activeTranslationControllers = new Map();
+const extensionApi = globalThis.browser || globalThis.chrome;
+const USES_PROMISE_API = typeof globalThis.browser !== "undefined";
 
-chrome.runtime.onInstalled.addListener(async () => {
-  const stored = await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS));
-  await chrome.storage.local.set(normalizeSettings(stored));
+extensionApi.runtime.onInstalled.addListener(async () => {
+  const stored = await storageGet(Object.keys(DEFAULT_SETTINGS));
+  const settings = normalizeSettings(stored);
+  await storageSet(settings);
+  await syncAutoTranslateContentScripts(settings);
 
-  chrome.contextMenus.create({
+  await contextMenusRemoveAll();
+  extensionApi.contextMenus.create({
     id: "translate-selection",
     title: "선택한 문장 번역",
     contexts: ["selection"]
   });
 });
 
-chrome.contextMenus.onClicked.addListener((info, tab) => {
-  if (info.menuItemId !== "translate-selection" || !tab?.id) return;
-  chrome.tabs.sendMessage(tab.id, {
-    type: "SHOW_SELECTION_TRANSLATION",
-    text: info.selectionText || ""
-  });
+extensionApi.runtime.onStartup.addListener(async () => {
+  await syncAutoTranslateContentScripts(await getSettings());
 });
 
-chrome.commands.onCommand.addListener(async (command) => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+extensionApi.contextMenus.onClicked.addListener(async (info, tab) => {
+  if (info.menuItemId !== "translate-selection" || !tab?.id) return;
+  if (!(await ensureContentScriptForTab(tab.id))) return;
+  sendTabMessage(tab.id, {
+    type: "SHOW_SELECTION_TRANSLATION",
+    text: info.selectionText || ""
+  }).catch(() => {});
+});
+
+extensionApi.commands.onCommand.addListener(async (command) => {
+  const [tab] = await tabsQuery({ active: true, currentWindow: true });
   if (!tab?.id) return;
 
   if (command === "toggle-page-translation") {
-    chrome.tabs.sendMessage(tab.id, { type: "TOGGLE_PAGE_TRANSLATION" });
+    if (!(await ensureContentScriptForTab(tab.id))) return;
+    sendTabMessage(tab.id, { type: "TOGGLE_PAGE_TRANSLATION" }).catch(() => {});
   }
 });
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "GET_SETTINGS") {
-    getSettings()
+    getSettings(message.pageUrl || sender?.tab?.url)
       .then(sendResponse)
       .catch((error) => sendResponse({ error: error.message }));
     return true;
   }
 
   if (message?.type === "SAVE_SETTINGS") {
-    const settings = normalizeSettings(message.settings || {});
-    chrome.storage.local
-      .set(settings)
-      .then(() => sendResponse({ ok: true, settings }))
+    saveSettings(message.settings || {}, message.pageUrl)
+      .then((settings) => sendResponse({ ok: true, settings }))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
@@ -101,9 +111,43 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
-async function getSettings() {
-  const stored = await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS));
-  return normalizeSettings(stored);
+async function getSettings(pageUrl) {
+  const stored = await storageGet(Object.keys(DEFAULT_SETTINGS));
+  const settings = normalizeSettings(stored);
+  return {
+    ...settings,
+    autoTranslate: isAutoTranslateEnabledForUrl(pageUrl, settings)
+  };
+}
+
+async function saveSettings(rawSettings, pageUrl) {
+  const existing = normalizeSettings(await storageGet(Object.keys(DEFAULT_SETTINGS)));
+  const settings = normalizeSettings({ ...existing, ...rawSettings });
+  const pageOrigin = getOriginPattern(pageUrl);
+  const origins = new Set(settings.autoTranslateOrigins);
+
+  if (pageOrigin) {
+    if (settings.autoTranslate) {
+      origins.add(pageOrigin);
+    } else {
+      origins.delete(pageOrigin);
+      await permissionsRemove({ origins: [pageOrigin] }).catch(() => false);
+    }
+  }
+
+  const storedSettings = normalizeSettings({
+    ...settings,
+    autoTranslate: false,
+    autoTranslateOrigins: Array.from(origins).sort()
+  });
+
+  await storageSet(storedSettings);
+  await syncAutoTranslateContentScripts(storedSettings);
+
+  return {
+    ...storedSettings,
+    autoTranslate: isAutoTranslateEnabledForUrl(pageUrl, storedSettings)
+  };
 }
 
 function normalizeSettings(settings = {}) {
@@ -120,6 +164,7 @@ function normalizeSettings(settings = {}) {
     maxBlockChars: clampInteger(merged.maxBlockChars, DEFAULT_SETTINGS.maxBlockChars, 240, 4000),
     requestTimeoutMs: clampNumber(merged.requestTimeoutMs, DEFAULT_SETTINGS.requestTimeoutMs, 10000, 600000),
     autoTranslate: Boolean(merged.autoTranslate),
+    autoTranslateOrigins: normalizeOriginPatterns(merged.autoTranslateOrigins),
     translationColor: normalizeHexColor(merged.translationColor, DEFAULT_SETTINGS.translationColor),
     translationDensity: normalizeChoice(merged.translationDensity, ["comfortable", "compact"], DEFAULT_SETTINGS.translationDensity),
     translationWidth: normalizeChoice(merged.translationWidth, ["content", "full"], DEFAULT_SETTINGS.translationWidth),
@@ -128,6 +173,146 @@ function normalizeSettings(settings = {}) {
     translationOffsetY: clampNumber(merged.translationOffsetY, DEFAULT_SETTINGS.translationOffsetY, -80, 80),
     customPrompt: normalizeCustomPrompt(merged.customPrompt)
   };
+}
+
+function normalizeOriginPatterns(value) {
+  if (!Array.isArray(value)) return [];
+  return Array.from(new Set(value.map((item) => String(item || "").trim()).filter(isSupportedOriginPattern))).sort();
+}
+
+function isSupportedOriginPattern(pattern) {
+  return /^https?:\/\/(?:\*\.)?[^/*:]+\/\*$/.test(pattern);
+}
+
+function getOriginPattern(pageUrl) {
+  try {
+    const url = new URL(pageUrl || "");
+    if (!["http:", "https:"].includes(url.protocol)) return "";
+    return `${url.protocol}//${url.hostname}/*`;
+  } catch {
+    return "";
+  }
+}
+
+function isAutoTranslateEnabledForUrl(pageUrl, settings) {
+  const origin = getOriginPattern(pageUrl);
+  return Boolean(origin && settings.autoTranslateOrigins.includes(origin));
+}
+
+async function syncAutoTranslateContentScripts(settings) {
+  const registered = await scriptingGetRegisteredContentScripts();
+  const currentIds = registered
+    .map((script) => script.id)
+    .filter((id) => id.startsWith("llt-auto-translate-"));
+
+  if (currentIds.length) {
+    await scriptingUnregisterContentScripts({ ids: currentIds });
+  }
+
+  const origins = [];
+  for (const origin of settings.autoTranslateOrigins) {
+    if (await permissionsContains({ origins: [origin] })) {
+      origins.push(origin);
+    }
+  }
+
+  if (!origins.length) return;
+
+  await scriptingRegisterContentScripts(origins.map((origin) => ({
+    id: getAutoTranslateScriptId(origin),
+    matches: [origin],
+    js: ["content.js"],
+    css: ["content.css"],
+    runAt: "document_idle"
+  })));
+}
+
+function getAutoTranslateScriptId(origin) {
+  let hash = 0;
+  for (let index = 0; index < origin.length; index += 1) {
+    hash = ((hash << 5) - hash + origin.charCodeAt(index)) | 0;
+  }
+  return `llt-auto-translate-${Math.abs(hash)}`;
+}
+
+async function ensureContentScriptForTab(tabId) {
+  try {
+    await sendTabMessage(tabId, { type: "PING" });
+    return true;
+  } catch {
+    try {
+      await scriptingInsertCSS({ target: { tabId }, files: ["content.css"] });
+      await scriptingExecuteScript({ target: { tabId }, files: ["content.js"] });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function callExtensionApi(method, ...args) {
+  if (USES_PROMISE_API) {
+    return method(...args);
+  }
+
+  return new Promise((resolve, reject) => {
+    method(...args, (result) => {
+      const error = globalThis.chrome?.runtime?.lastError;
+      if (error) {
+        reject(new Error(error.message));
+        return;
+      }
+      resolve(result);
+    });
+  });
+}
+
+function storageGet(keys) {
+  return callExtensionApi(extensionApi.storage.local.get.bind(extensionApi.storage.local), keys);
+}
+
+function storageSet(items) {
+  return callExtensionApi(extensionApi.storage.local.set.bind(extensionApi.storage.local), items);
+}
+
+function contextMenusRemoveAll() {
+  return callExtensionApi(extensionApi.contextMenus.removeAll.bind(extensionApi.contextMenus));
+}
+
+function tabsQuery(queryInfo) {
+  return callExtensionApi(extensionApi.tabs.query.bind(extensionApi.tabs), queryInfo);
+}
+
+function sendTabMessage(tabId, message) {
+  return callExtensionApi(extensionApi.tabs.sendMessage.bind(extensionApi.tabs), tabId, message);
+}
+
+function permissionsContains(permissions) {
+  return callExtensionApi(extensionApi.permissions.contains.bind(extensionApi.permissions), permissions);
+}
+
+function permissionsRemove(permissions) {
+  return callExtensionApi(extensionApi.permissions.remove.bind(extensionApi.permissions), permissions);
+}
+
+function scriptingGetRegisteredContentScripts() {
+  return callExtensionApi(extensionApi.scripting.getRegisteredContentScripts.bind(extensionApi.scripting));
+}
+
+function scriptingRegisterContentScripts(scripts) {
+  return callExtensionApi(extensionApi.scripting.registerContentScripts.bind(extensionApi.scripting), scripts);
+}
+
+function scriptingUnregisterContentScripts(filter) {
+  return callExtensionApi(extensionApi.scripting.unregisterContentScripts.bind(extensionApi.scripting), filter);
+}
+
+function scriptingInsertCSS(details) {
+  return callExtensionApi(extensionApi.scripting.insertCSS.bind(extensionApi.scripting), details);
+}
+
+function scriptingExecuteScript(details) {
+  return callExtensionApi(extensionApi.scripting.executeScript.bind(extensionApi.scripting), details);
 }
 
 function normalizeHexColor(value, fallback) {

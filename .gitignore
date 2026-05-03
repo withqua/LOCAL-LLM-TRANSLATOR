@@ -5,3 +5,6 @@
 *.crx
 *.pem
 *.zip
+
+# Generated browser builds
+dist/

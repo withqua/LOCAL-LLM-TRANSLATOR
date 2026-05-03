@@ -16,6 +16,8 @@ const GOOGLE_TITLE_SELECTOR = "h3,.LC20lb,[role='heading']";
 const TRANSLATION_WIDTHS = new Set(["content", "full"]);
 const TRANSLATION_DENSITIES = new Set(["comfortable", "compact"]);
 const TITLE_PLACEMENTS = new Set(["auto", "beside", "below"]);
+const extensionApi = globalThis.browser || globalThis.chrome;
+const USES_PROMISE_API = typeof globalThis.browser !== "undefined";
 
 const TEXT_SELECTOR = [
   "article p",
@@ -94,6 +96,7 @@ const CHILD_TEXT_SELECTOR = [
   ".fancy-title"
 ].join(",");
 
+installRuntimeMessageListener();
 init();
 
 async function init() {
@@ -101,27 +104,42 @@ async function init() {
   if (!settings) return;
   STATE.settings = settings;
 
-  chrome.runtime.onMessage.addListener((message) => {
-    if (message?.type === "TOGGLE_PAGE_TRANSLATION") {
-      togglePageTranslation();
-    }
-
-    if (message?.type === "SET_SETTINGS") {
-      STATE.settings = { ...STATE.settings, ...(message.settings || {}) };
-      applySettingsToExistingTranslations();
-    }
-
-    if (message?.type === "SHOW_SELECTION_TRANSLATION") {
-      showSelectionTranslation(message.text || "");
-    }
-  });
-
   if (settings.autoTranslate) {
     scheduleAutoTranslate();
   }
 
   installRouteChangeWatcher();
   installAutoTranslateMutationWatcher();
+}
+
+function installRuntimeMessageListener() {
+  extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === "PING") {
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (message?.type === "TOGGLE_PAGE_TRANSLATION") {
+      togglePageTranslation();
+    }
+
+    if (message?.type === "SET_SETTINGS") {
+      const wasAutoTranslateEnabled = Boolean(STATE.settings?.autoTranslate);
+      STATE.settings = { ...STATE.settings, ...(message.settings || {}) };
+      applySettingsToExistingTranslations();
+      if (!STATE.settings.autoTranslate) {
+        clearTimeout(STATE.routeTimer);
+        STATE.routeTimer = null;
+      }
+      if (!wasAutoTranslateEnabled && STATE.settings.autoTranslate && !STATE.translated && !STATE.translating) {
+        scheduleAutoTranslate(0);
+      }
+    }
+
+    if (message?.type === "SHOW_SELECTION_TRANSLATION") {
+      showSelectionTranslation(message.text || "");
+    }
+  });
 }
 
 async function togglePageTranslation() {
@@ -143,11 +161,16 @@ async function togglePageTranslation() {
       return;
     }
 
+    let activeChunk = [];
     let completedCount = 0;
+    const totalCount = getBlocksElementCount(blocks);
     for (const chunk of chunkArray(blocks, getChunkSize())) {
+      activeChunk = chunk;
       if (isStaleTranslationRun(runId, startUrl)) return;
 
-      chunk.forEach((item) => insertLoadingTranslation(item.element));
+      chunk.forEach((item) => {
+        item.elements.forEach((element) => insertLoadingTranslation(element));
+      });
 
       const texts = chunk.map((item) => item.text);
       const response = await sendRuntimeMessage({
@@ -163,11 +186,14 @@ async function togglePageTranslation() {
       }
 
       response.translations.forEach((translation, index) => {
-        finishBilingualTranslation(chunk[index].element, translation);
+        chunk[index].elements.forEach((element) => {
+          finishBilingualTranslation(element, translation);
+        });
       });
 
-      completedCount += chunk.length;
-      showPageStatus(`페이지 번역 중... ${completedCount}/${blocks.length}`);
+      completedCount += getBlocksElementCount(chunk);
+      showPageStatus(`페이지 번역 중... ${completedCount}/${totalCount}`);
+      activeChunk = [];
     }
 
     STATE.translated = true;
@@ -175,10 +201,7 @@ async function togglePageTranslation() {
   } catch (error) {
     if (isStaleTranslationRun(runId, startUrl)) return;
     console.error(error);
-    document.querySelectorAll(".llt-loading").forEach((element) => {
-      element.classList.remove("llt-loading");
-      element.textContent = error.message || "번역 실패.";
-    });
+    resetFailedTranslationChunk(activeChunk);
     showPageStatus(error.message || "번역 실패.");
   } finally {
     if (!isStaleTranslationRun(runId, startUrl)) {
@@ -190,24 +213,37 @@ async function togglePageTranslation() {
 
 function collectTranslatableBlocks() {
   const elements = Array.from(document.querySelectorAll(TEXT_SELECTOR));
-  const seen = new Set();
+  const blocksByText = new Map();
   const blocks = [];
   const maxBlocks = getMaxBlocks();
   const maxBlockChars = getMaxBlockChars();
+  let elementCount = 0;
 
   for (const element of elements) {
     if (!isGoodCandidate(element)) continue;
 
     const text = buildTranslationInput(element).text;
-    if (!text || seen.has(text)) continue;
+    if (!text) continue;
     if (text.length > maxBlockChars) continue;
 
-    seen.add(text);
-    blocks.push({ element, text });
-    if (blocks.length >= maxBlocks) break;
+    const existing = blocksByText.get(text);
+    if (existing) {
+      existing.elements.push(element);
+    } else {
+      const block = { elements: [element], text };
+      blocksByText.set(text, block);
+      blocks.push(block);
+    }
+
+    elementCount += 1;
+    if (elementCount >= maxBlocks) break;
   }
 
   return blocks;
+}
+
+function getBlocksElementCount(blocks) {
+  return blocks.reduce((count, block) => count + block.elements.length, 0);
 }
 
 function isGoodCandidate(element) {
@@ -324,6 +360,25 @@ function finishBilingualTranslation(element, translation) {
   renderTranslationContent(translationElement, translation || "번역 실패.", element);
 }
 
+function resetFailedTranslationChunk(chunk) {
+  chunk.forEach((item) => {
+    item.elements.forEach((element) => {
+      const translationElement = findTranslationElement(element);
+      if (translationElement?.classList.contains("llt-loading")) {
+        translationElement.remove();
+      }
+
+      const spacer = element.lastElementChild;
+      if (spacer?.classList.contains("llt-inline-spacer")) {
+        spacer.remove();
+      }
+
+      element.removeAttribute("data-llt-translated");
+      element.removeAttribute("data-llt-original-display");
+    });
+  });
+}
+
 function findTranslationElement(element) {
   const placement = getTranslationPlacement(element);
 
@@ -389,7 +444,7 @@ function showSelectionTranslation(text) {
 
 function sendRuntimeMessage(message, timeoutMs = 125000) {
   return new Promise((resolve, reject) => {
-    if (!chrome?.runtime?.id) {
+    if (!extensionApi?.runtime?.id) {
       reject(new Error("확장 프로그램이 다시 로드되었습니다. 확장 프로그램을 새로고침한 뒤 이 페이지도 새로고침하세요."));
       return;
     }
@@ -398,11 +453,28 @@ function sendRuntimeMessage(message, timeoutMs = 125000) {
       reject(new Error("확장 메시지 시간이 초과되었습니다. LM Studio가 아직 생성 중일 수 있습니다."));
     }, timeoutMs);
 
-    chrome.runtime.sendMessage(message, (response) => {
-      clearTimeout(timeout);
+    sendExtensionMessage(message)
+      .then((response) => {
+        clearTimeout(timeout);
+        resolve(response);
+      })
+      .catch((error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+  });
+}
 
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
+function sendExtensionMessage(message) {
+  if (USES_PROMISE_API) {
+    return extensionApi.runtime.sendMessage(message);
+  }
+
+  return new Promise((resolve, reject) => {
+    extensionApi.runtime.sendMessage(message, (response) => {
+      const error = globalThis.chrome?.runtime?.lastError;
+      if (error) {
+        reject(new Error(error.message));
         return;
       }
 
@@ -818,6 +890,7 @@ function scheduleAutoTranslate(attempt = 0) {
   STATE.routeTimer = setTimeout(() => {
     STATE.routeTimer = null;
     if (location.href !== scheduledUrl) return;
+    if (!STATE.settings?.autoTranslate) return;
     if (STATE.translated || STATE.translating) return;
 
     if (!collectTranslatableBlocks().length && attempt < 12) {
@@ -834,9 +907,7 @@ function isStaleTranslationRun(runId, startUrl) {
 }
 
 function cancelActivePageTranslation() {
-  if (!chrome?.runtime?.id) return;
+  if (!extensionApi?.runtime?.id) return;
 
-  chrome.runtime.sendMessage({ type: "CANCEL_TRANSLATION", scope: "page" }, () => {
-    void chrome.runtime.lastError;
-  });
+  sendExtensionMessage({ type: "CANCEL_TRANSLATION", scope: "page" }).catch(() => {});
 }
